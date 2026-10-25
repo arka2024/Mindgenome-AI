@@ -1,0 +1,940 @@
+openapi: 3.1.0
+info:
+  title: MindGenome AI API
+  version: 0.1.0
+  description: |
+    Personal knowledge genome and adaptive learning. All document, graph, vector,
+    and mastery resources are scoped to the authenticated user.
+servers:
+  - url: http://localhost:8000/api/v1
+    description: local
+  - url: https://api.mindgenome.example/api/v1
+    description: production
+tags:
+  - name: auth
+  - name: documents
+  - name: graph
+  - name: tutor
+  - name: learning
+  - name: quizzes
+  - name: mastery
+  - name: dashboard
+  - name: meta
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      tags: [meta]
+      security: []
+      operationId: health
+      responses:
+        "200":
+          description: Process is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /ready:
+    get:
+      tags: [meta]
+      security: []
+      operationId: ready
+      responses:
+        "200":
+          description: Ready or degraded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ready"
+        "503":
+          description: Not ready
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /auth/register:
+    post:
+      tags: [auth]
+      security: []
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /auth/login:
+    post:
+      tags: [auth]
+      security: []
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /auth/refresh:
+    post:
+      tags: [auth]
+      security: []
+      operationId: refresh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: Rotated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "204":
+          description: Revoked
+  /auth/google/start:
+    get:
+      tags: [auth]
+      security: []
+      operationId: googleStart
+      responses:
+        "302":
+          description: Redirect to Google
+  /auth/google/callback:
+    get:
+      tags: [auth]
+      security: []
+      operationId: googleCallback
+      parameters:
+        - in: query
+          name: code
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: state
+          required: true
+          schema:
+            type: string
+      responses:
+        "302":
+          description: Redirect to frontend with cookies/tokens handled by BFF pattern
+  /auth/me:
+    get:
+      tags: [auth]
+      operationId: me
+      responses:
+        "200":
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+  /documents:
+    get:
+      tags: [documents]
+      operationId: listDocuments
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Page of documents
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentPage"
+    post:
+      tags: [documents]
+      operationId: uploadDocument
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadAccepted"
+        "413":
+          $ref: "#/components/responses/UploadRejected"
+        "415":
+          $ref: "#/components/responses/UploadRejected"
+  /documents/{document_id}:
+    get:
+      tags: [documents]
+      operationId: getDocument
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+      responses:
+        "200":
+          description: Document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Document"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /ingestion-jobs/{job_id}:
+    get:
+      tags: [documents]
+      operationId: getIngestionJob
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Job
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestionJob"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /graph:
+    get:
+      tags: [graph]
+      operationId: getGraph
+      responses:
+        "200":
+          description: Cytoscape-ready subgraph
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphPayload"
+  /graph/edges/{edge_id}/review:
+    post:
+      tags: [graph]
+      operationId: reviewEdge
+      parameters:
+        - name: edge_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EdgeReview"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EdgeReviewResult"
+  /tutor/ask:
+    post:
+      tags: [tutor]
+      operationId: tutorAsk
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TutorAsk"
+      responses:
+        "200":
+          description: Grounded answer or explicit low-confidence
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TutorAnswer"
+  /learning-sessions:
+    post:
+      tags: [learning]
+      operationId: startLearningSession
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartSession"
+      responses:
+        "201":
+          description: Started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LearningSession"
+  /learning-sessions/{session_id}:
+    get:
+      tags: [learning]
+      operationId: getLearningSession
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LearningSession"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /quiz-attempts:
+    post:
+      tags: [quizzes]
+      operationId: createQuizAttempt
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateQuiz"
+      responses:
+        "201":
+          description: Attempt with questions (no correct_index)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuizAttemptView"
+  /quiz-attempts/{attempt_id}/submit:
+    post:
+      tags: [quizzes]
+      operationId: submitQuiz
+      parameters:
+        - name: attempt_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitQuiz"
+      responses:
+        "200":
+          description: Score, mastery delta, next action
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuizResult"
+  /mastery:
+    get:
+      tags: [mastery]
+      operationId: listMastery
+      responses:
+        "200":
+          description: All concept scores for the user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MasteryList"
+  /mastery/{concept_id}:
+    get:
+      tags: [mastery]
+      operationId: getMastery
+      parameters:
+        - name: concept_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Traceable score
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MasteryDetail"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /learning-path:
+    get:
+      tags: [learning]
+      operationId: getLearningPath
+      responses:
+        "200":
+          description: Explainable recommendations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LearningPath"
+  /dashboard:
+    get:
+      tags: [dashboard]
+      operationId: getDashboard
+      responses:
+        "200":
+          description: Home summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Dashboard"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    Page:
+      in: query
+      name: page
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSize:
+      in: query
+      name: page_size
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+    DocumentId:
+      in: path
+      name: document_id
+      required: true
+      schema:
+        type: string
+        format: uuid
+    JobId:
+      in: path
+      name: job_id
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: Not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Conflict:
+      description: Conflict
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    UploadRejected:
+      description: Upload rejected
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        request_id:
+          type: string
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+    Ready:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ready, degraded]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [up, down]
+    RegisterRequest:
+      type: object
+      required: [email, password, display_name]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 12
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 80
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          enum: [bearer]
+        expires_in:
+          type: integer
+    User:
+      type: object
+      required: [id, email, display_name, roles]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        display_name:
+          type: string
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [user, admin]
+    Document:
+      type: object
+      required: [id, filename, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        status:
+          type: string
+          enum: [uploaded, processing, ready, failed, rejected]
+        is_low_text:
+          type: boolean
+        low_text_warning:
+          type: string
+          nullable: true
+        page_count:
+          type: integer
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    DocumentPage:
+      type: object
+      required: [items, page, page_size, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Document"
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+    UploadAccepted:
+      type: object
+      required: [document_id, job_id, status]
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued]
+    IngestionJob:
+      type: object
+      required: [id, document_id, status, progress_pct]
+      properties:
+        id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum:
+            - queued
+            - parsing
+            - chunking
+            - embedding
+            - extracting
+            - graph_built
+            - ready
+            - failed
+        progress_pct:
+          type: integer
+          minimum: 0
+          maximum: 100
+        stage_detail:
+          type: string
+          nullable: true
+        error_code:
+          type: string
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+    GraphPayload:
+      type: object
+      required: [nodes, edges]
+      properties:
+        nodes:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        edges:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    EdgeReview:
+      type: object
+      required: [decision]
+      properties:
+        decision:
+          type: string
+          enum: [confirmed, rejected]
+    EdgeReviewResult:
+      type: object
+      required: [edge_id, status]
+      properties:
+        edge_id:
+          type: string
+        status:
+          type: string
+          enum: [confirmed, rejected]
+    TutorAsk:
+      type: object
+      required: [question]
+      properties:
+        question:
+          type: string
+          minLength: 3
+          maxLength: 4000
+        document_id:
+          type: string
+          format: uuid
+    Citation:
+      type: object
+      required: [document_id, filename, page_start, page_end, chunk_id]
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        chapter_title:
+          type: string
+          nullable: true
+        page_start:
+          type: integer
+        page_end:
+          type: integer
+        chunk_id:
+          type: string
+          format: uuid
+    TutorAnswer:
+      type: object
+      required: [grounded, confidence, message, citations]
+      properties:
+        grounded:
+          type: boolean
+        confidence:
+          type: string
+          enum: [high, medium, low]
+        message:
+          type: string
+        citations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Citation"
+    StartSession:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [learn, remedial, revision]
+        concept_id:
+          type: string
+          format: uuid
+    LearningSession:
+      type: object
+      required: [id, mode, status, current_section, because]
+      properties:
+        id:
+          type: string
+          format: uuid
+        mode:
+          type: string
+        status:
+          type: string
+        current_section:
+          type: string
+        because:
+          type: string
+    CreateQuiz:
+      type: object
+      required: [concept_id]
+      properties:
+        concept_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+    QuizQuestionView:
+      type: object
+      required: [id, stem, choices, difficulty]
+      properties:
+        id:
+          type: string
+          format: uuid
+        stem:
+          type: string
+        choices:
+          type: array
+          items:
+            type: string
+        difficulty:
+          type: string
+          enum: [easy, medium, hard]
+    QuizAttemptView:
+      type: object
+      required: [id, questions]
+      properties:
+        id:
+          type: string
+          format: uuid
+        questions:
+          type: array
+          items:
+            $ref: "#/components/schemas/QuizQuestionView"
+    SubmitQuiz:
+      type: object
+      required: [answers]
+      properties:
+        answers:
+          type: array
+          items:
+            type: object
+            required: [question_id, selected_index]
+            properties:
+              question_id:
+                type: string
+                format: uuid
+              selected_index:
+                type: integer
+                minimum: 0
+    QuizResult:
+      type: object
+      required: [attempt_id, correct, total, mastery, next]
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+        correct:
+          type: integer
+        total:
+          type: integer
+        mastery:
+          $ref: "#/components/schemas/MasteryScore"
+        next:
+          $ref: "#/components/schemas/NextAction"
+    NextAction:
+      type: object
+      required: [mode, because]
+      properties:
+        mode:
+          type: string
+          enum: [learn, remedial, revision]
+        concept_id:
+          type: string
+          format: uuid
+          nullable: true
+        because:
+          type: string
+    MasteryScore:
+      type: object
+      required:
+        - concept_id
+        - mastery
+        - band
+        - evidence_n
+        - quiz_accuracy
+        - recent_performance
+        - difficulty_adjusted
+        - retention
+      properties:
+        concept_id:
+          type: string
+          format: uuid
+        mastery:
+          type: number
+        band:
+          type: string
+          enum:
+            - insufficient_evidence
+            - beginner
+            - developing
+            - proficient
+            - mastered
+        evidence_n:
+          type: integer
+        quiz_accuracy:
+          type: number
+        recent_performance:
+          type: number
+        difficulty_adjusted:
+          type: number
+        retention:
+          type: number
+        component_trace:
+          type: object
+          additionalProperties: true
+    MasteryList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/MasteryScore"
+    MasteryDetail:
+      allOf:
+        - $ref: "#/components/schemas/MasteryScore"
+        - type: object
+          properties:
+            history:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+    LearningPath:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [concept_id, name, because]
+            properties:
+              concept_id:
+                type: string
+                format: uuid
+              name:
+                type: string
+              because:
+                type: string
+    Dashboard:
+      type: object
+      required: [weak_concepts, due_revisions, active_jobs]
+      properties:
+        weak_concepts:
+          type: array
+          items:
+            $ref: "#/components/schemas/MasteryScore"
+        due_revisions:
+          type: integer
+        active_jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/IngestionJob"
