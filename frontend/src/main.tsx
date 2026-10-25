@@ -5,7 +5,7 @@ import App from './App.tsx'
 import { env } from './shared/lib/env'
 
 async function bootstrap() {
-  if (import.meta.env.DEV && env.useMocks) {
+  if (env.useMocks) {
     const { worker } = await import('./mocks/browser')
     await worker.start({ onUnhandledRequest: 'bypass' })
   }
