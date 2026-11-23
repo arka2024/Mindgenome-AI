@@ -1,0 +1,1 @@
+﻿Gradient boosting combines weak decision trees. Ensemble learning improves predictive accuracy by combining multiple models.

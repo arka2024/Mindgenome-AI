@@ -1,0 +1,2 @@
+﻿# Photosynthesis
+Chlorophyll absorbs light energy in chloroplasts. The light-dependent reactions produce ATP and NADPH. The Calvin cycle fixes carbon dioxide into glucose.

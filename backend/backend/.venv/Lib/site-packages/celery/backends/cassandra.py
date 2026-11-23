@@ -1,0 +1,343 @@
+"""Apache Cassandra result store backend using the DataStax driver."""
+import threading
+
+from kombu.utils.encoding import ensure_bytes
+
+from celery import states
+from celery.exceptions import ImproperlyConfigured
+from celery.utils.log import get_logger
+
+from .base import BaseBackend
+
+try:  # pragma: no cover
+    import cassandra
+    import cassandra.auth
+    import cassandra.cluster
+    import cassandra.query
+except ImportError:
+    cassandra = None
+
+
+__all__ = ('CassandraBackend',)
+
+logger = get_logger(__name__)
+
+E_NO_CASSANDRA = """
+You need to install the cassandra-driver library to
+use the Cassandra backend.  See https://github.com/datastax/python-driver
+"""
+
+E_NO_SUCH_CASSANDRA_AUTH_PROVIDER = """
+CASSANDRA_AUTH_PROVIDER you provided is not a valid auth_provider class.
+See https://datastax.github.io/python-driver/api/cassandra/auth.html.
+"""
+
+E_CASSANDRA_MISCONFIGURED = 'Cassandra backend improperly configured.'
+
+E_CASSANDRA_NOT_CONFIGURED = 'Cassandra backend not configured.'
+
+Q_INSERT_RESULT = """
+INSERT INTO {table} (
+    task_id, status, result, date_done, traceback, children) VALUES (
+        %s, %s, %s, %s, %s, %s) {expires};
+"""
+
+Q_SELECT_RESULT = """
+SELECT status, result, date_done, traceback, children
+FROM {table}
+WHERE task_id=%s
+LIMIT 1
+"""
+
+Q_DELETE_RESULT = """
+DELETE FROM {table} WHERE task_id=%s
+"""
+
+Q_CREATE_RESULT_TABLE = """
+CREATE TABLE {table} (
+    task_id text,
+    status text,
+    result blob,
+    date_done timestamp,
+    traceback blob,
+    children blob,
+    PRIMARY KEY ((task_id), date_done)
+) WITH CLUSTERING ORDER BY (date_done DESC);
+"""
+
+Q_EXPIRES = """
+    USING TTL {0}
+"""
+
+
+def buf_t(x):
+    # The payload is str for serializers that produce text and bytes for the
+    # binary ones, and always bytes once result_compression is set, so pass
+    # bytes through rather than assuming str.
+    return ensure_bytes(x)
+
+
+class CassandraBackend(BaseBackend):
+    """Cassandra/AstraDB backend utilizing DataStax driver.
+
+    Raises:
+        celery.exceptions.ImproperlyConfigured:
+            if module :pypi:`cassandra-driver` is not available,
+            or not-exactly-one of the :setting:`cassandra_servers` and
+            the :setting:`cassandra_secure_bundle_path` settings is set.
+    """
+
+    #: List of Cassandra servers with format: ``hostname``.
+    servers = None
+    #: Location of the secure connect bundle zipfile (absolute path).
+    bundle_path = None
+
+    supports_autoexpire = True      # autoexpire supported via entry_ttl
+
+    # The result, traceback and children columns are all blobs.
+    supports_result_compression = True
+
+    def __init__(self, servers=None, keyspace=None, table=None, entry_ttl=None,
+                 port=None, bundle_path=None, **kwargs):
+        super().__init__(**kwargs)
+
+        if not cassandra:
+            raise ImproperlyConfigured(E_NO_CASSANDRA)
+
+        conf = self.app.conf
+        self.servers = servers or conf.get('cassandra_servers', None)
+        self.bundle_path = bundle_path or conf.get(
+            'cassandra_secure_bundle_path', None)
+        self.port = port or conf.get('cassandra_port', None) or 9042
+        self.keyspace = keyspace or conf.get('cassandra_keyspace', None)
+        self.table = table or conf.get('cassandra_table', None)
+        self.cassandra_options = conf.get('cassandra_options', {})
+
+        # either servers or bundle path must be provided...
+        db_directions = self.servers or self.bundle_path
+        if not db_directions or not self.keyspace or not self.table:
+            raise ImproperlyConfigured(E_CASSANDRA_NOT_CONFIGURED)
+        # ...but not both:
+        if self.servers and self.bundle_path:
+            raise ImproperlyConfigured(E_CASSANDRA_MISCONFIGURED)
+
+        expires = entry_ttl or conf.get('cassandra_entry_ttl', None)
+
+        self.cqlexpires = (
+            Q_EXPIRES.format(expires) if expires is not None else '')
+
+        read_cons = conf.get('cassandra_read_consistency') or 'LOCAL_QUORUM'
+        write_cons = conf.get('cassandra_write_consistency') or 'LOCAL_QUORUM'
+
+        self.read_consistency = getattr(
+            cassandra.ConsistencyLevel, read_cons,
+            cassandra.ConsistencyLevel.LOCAL_QUORUM)
+        self.write_consistency = getattr(
+            cassandra.ConsistencyLevel, write_cons,
+            cassandra.ConsistencyLevel.LOCAL_QUORUM)
+
+        self.auth_provider = None
+        auth_provider = conf.get('cassandra_auth_provider', None)
+        auth_kwargs = conf.get('cassandra_auth_kwargs', None)
+        if auth_provider and auth_kwargs:
+            auth_provider_class = getattr(cassandra.auth, auth_provider, None)
+            if not auth_provider_class:
+                raise ImproperlyConfigured(E_NO_SUCH_CASSANDRA_AUTH_PROVIDER)
+            self.auth_provider = auth_provider_class(**auth_kwargs)
+
+        self._cluster = None
+        self._session = None
+        self._write_stmt = None
+        self._read_stmt = None
+        self._table_created = False
+        self._lock = threading.RLock()
+
+    def _is_ready(self, write):
+        """Tell whether the published connection suits this caller.
+
+        A reader only needs the session, but a writer also needs the result
+        table, which a reader does not create.
+        """
+        return self._session is not None and (
+            self._table_created or not write)
+
+    def _get_connection(self, write=False):
+        """Prepare the connection for action.
+
+        Arguments:
+            write (bool): are we a writer?
+        """
+        if self._is_ready(write):
+            return
+        self._lock.acquire()
+        try:
+            if self._is_ready(write):
+                return
+
+            session = self._session
+            write_stmt = self._write_stmt
+            read_stmt = self._read_stmt
+            # Whether *this* call is the one building the Cluster, as
+            # opposed to reusing one a previous call already published.
+            # Only a Cluster we create here, and for which we never obtain
+            # a usable session, is ours to tear down on failure: a session
+            # published earlier (or one we manage to connect further down)
+            # may already be in use by other threads through the lock-free
+            # fast path in _is_ready(), so resetting it here would pull it
+            # out from under them.
+            created_here = session is None
+
+            if session is None:
+                # using either 'servers' or 'bundle_path' here:
+                if self.servers:
+                    self._cluster = cassandra.cluster.Cluster(
+                        self.servers, port=self.port,
+                        auth_provider=self.auth_provider,
+                        **self.cassandra_options)
+                else:
+                    # 'bundle_path' is guaranteed to be set
+                    self._cluster = cassandra.cluster.Cluster(
+                        cloud={
+                            'secure_connect_bundle': self.bundle_path,
+                        },
+                        auth_provider=self.auth_provider,
+                        **self.cassandra_options)
+                session = self._cluster.connect(self.keyspace)
+
+                # We're forced to do concatenation below, as formatting would
+                # blow up on superficial %s that'll be processed by Cassandra
+                write_stmt = cassandra.query.SimpleStatement(
+                    Q_INSERT_RESULT.format(
+                        table=self.table, expires=self.cqlexpires),
+                )
+                write_stmt.consistency_level = self.write_consistency
+
+                read_stmt = cassandra.query.SimpleStatement(
+                    Q_SELECT_RESULT.format(table=self.table),
+                )
+                read_stmt.consistency_level = self.read_consistency
+
+            table_created = self._table_created
+            if write:
+                # Only possible writers "workers" are allowed to issue
+                # CREATE TABLE.  This is to prevent conflicting situations
+                # where both task-creator and task-executor would issue it
+                # at the same time.
+
+                # Anyway; if you're doing anything critical, you should
+                # have created this table in advance, in which case
+                # this query will be a no-op (AlreadyExists)
+                make_stmt = cassandra.query.SimpleStatement(
+                    Q_CREATE_RESULT_TABLE.format(table=self.table),
+                )
+                make_stmt.consistency_level = self.write_consistency
+
+                try:
+                    session.execute(make_stmt)
+                except cassandra.AlreadyExists:
+                    pass
+                except Exception:
+                    # CREATE failed for some other reason: a timeout, or
+                    # (a real production setup) a worker role that can
+                    # read/write but was never granted CREATE, which raises
+                    # Unauthorized on every write. We haven't verified how
+                    # Cassandra's Unauthorized for a missing CREATE grant
+                    # differs from other authorization failures, so we
+                    # don't gamble on treating it like AlreadyExists.
+                    # Instead we publish the session and statements we
+                    # already hold a good connection for -- readers, and
+                    # writers that skip CREATE next time, keep working --
+                    # and leave _table_created False so the next writer
+                    # retries CREATE instead of assuming it succeeded. This
+                    # also means a Cluster we just built is no longer
+                    # "created_here" as far as the outer handler is
+                    # concerned: it's been published, not discarded.
+                    self._write_stmt = write_stmt
+                    self._read_stmt = read_stmt
+                    self._session = session
+                    self._table_created = False
+                    raise
+                table_created = True
+
+            # Other threads check _session and _table_created without
+            # holding the lock, so they must only be published once the
+            # statements are prepared and, for a writer, the table exists.
+            self._write_stmt = write_stmt
+            self._read_stmt = read_stmt
+            self._session = session
+            self._table_created = table_created
+
+        except Exception:
+            # A Cluster we created in this call, and for which we never
+            # published a usable session (e.g. Cluster.connect() itself
+            # timed out or otherwise failed), has nothing worth keeping:
+            # shut it down so the next call builds a fresh one instead of
+            # leaking this one. A Cluster whose session we did publish
+            # above, or one that was already published by an earlier
+            # call, is left alone.
+            if created_here and self._session is None and \
+                    self._cluster is not None:
+                self._cluster.shutdown()     # also shuts down _session
+                self._cluster = None
+            raise   # we did fail after all - reraise
+        finally:
+            self._lock.release()
+
+    def _store_result(self, task_id, result, state,
+                      traceback=None, request=None, **kwargs):
+        """Store return value and state of an executed task."""
+        self._get_connection(write=True)
+
+        # Create the table before reading, and keep the first SUCCESS result.
+        # Only the status is needed; do not decode the stored payload.
+        row = self._session.execute(self._read_stmt, (task_id,)).one()
+        if row is not None and row[0] == states.SUCCESS:
+            return
+
+        self._session.execute(self._write_stmt, (
+            task_id,
+            state,
+            buf_t(self.encode(result)),
+            self.app.now(),
+            buf_t(self.encode(traceback)),
+            buf_t(self.encode(self.current_task_children(request)))
+        ))
+
+    def _forget(self, task_id):
+        """Delete all state entries for a task."""
+        self._get_connection(write=True)
+        stmt = cassandra.query.SimpleStatement(
+            Q_DELETE_RESULT.format(table=self.table),
+        )
+        stmt.consistency_level = self.write_consistency
+        self._session.execute(stmt, (task_id,))
+
+    def as_uri(self, include_password=True):
+        return 'cassandra://'
+
+    def _get_task_meta_for(self, task_id):
+        """Get task meta-data for a task by id."""
+        self._get_connection()
+
+        res = self._session.execute(self._read_stmt, (task_id, )).one()
+        if not res:
+            return {'status': states.PENDING, 'result': None}
+
+        status, result, date_done, traceback, children = res
+
+        return self.meta_from_decoded({
+            'task_id': task_id,
+            'status': status,
+            'result': self.decode(result),
+            'date_done': date_done,
+            'traceback': self.decode(traceback),
+            'children': self.decode(children),
+        })
+
+    def __reduce__(self, args=(), kwargs=None):
+        kwargs = {} if not kwargs else kwargs
+        kwargs.update(
+            {'servers': self.servers,
+             'keyspace': self.keyspace,
+             'table': self.table})
+        return super().__reduce__(args, kwargs)

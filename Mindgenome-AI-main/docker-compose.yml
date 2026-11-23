@@ -1,0 +1,249 @@
+version: "3.8"
+
+services:
+  # =============================================================================
+  # PostgreSQL 16 - Relational Source of Truth (with RLS)
+  # =============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: mindgenome_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mindgenome}
+      POSTGRES_USER: ${POSTGRES_USER:-mindgenome}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mindgenome_secure_password_2026}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mindgenome} -d ${POSTGRES_DB:-mindgenome}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mindgenome-net
+
+  # =============================================================================
+  # Redis 7 - Cache, Rate Limiter & Celery Broker
+  # =============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: mindgenome_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-redis_secure_password_2026}"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_secure_password_2026}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mindgenome-net
+
+  # =============================================================================
+  # MinIO - S3-Compatible Object Storage
+  # =============================================================================
+  minio:
+    image: minio/minio:RELEASE.2024-05-10T01-41-38Z
+    container_name: mindgenome_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-miniosecurepassword2026}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      - mindgenome-net
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: mindgenome_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-miniosecurepassword2026};
+      /usr/bin/mc mb --ignore-existing local/${S3_BUCKET_NAME:-mindgenome-documents};
+      exit 0;
+      "
+    networks:
+      - mindgenome-net
+
+  # =============================================================================
+  # Qdrant - Vector Database (384-d Cosine Embeddings)
+  # =============================================================================
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    container_name: mindgenome_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrantdata:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mindgenome-net
+
+  # =============================================================================
+  # Neo4j 5 - Concept Knowledge Graph
+  # =============================================================================
+  neo4j:
+    image: neo4j:5.20-community
+    container_name: mindgenome_neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-neo4j_secure_password_2026}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      NEO4J_dbms_memory_heap_initial__size: "512m"
+      NEO4J_dbms_memory_heap_max__size: "1G"
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4jdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - mindgenome-net
+
+  # =============================================================================
+  # FastAPI Application Backend
+  # =============================================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mindgenome_backend
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-change-me-in-production-super-secret-key-32-chars-min}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mindgenome}:${POSTGRES_PASSWORD:-mindgenome_secure_password_2026}@postgres:5432/${POSTGRES_DB:-mindgenome}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secure_password_2026}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_secure_password_2026}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_secure_password_2026}@redis:6379/2
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-miniosecurepassword2026}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-mindgenome-documents}
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4j_secure_password_2026}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      CORS_ORIGINS: '["http://localhost:5173", "http://localhost:3000"]'
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    networks:
+      - mindgenome-net
+
+  # =============================================================================
+  # Celery Asynchronous Task Worker
+  # =============================================================================
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mindgenome_celery_worker
+    restart: unless-stopped
+    command: ["celery", "-A", "app.workers.celery_app.celery_app", "worker", "-l", "info", "-c", "4"]
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mindgenome}:${POSTGRES_PASSWORD:-mindgenome_secure_password_2026}@postgres:5432/${POSTGRES_DB:-mindgenome}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secure_password_2026}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_secure_password_2026}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_secure_password_2026}@redis:6379/2
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-miniosecurepassword2026}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-mindgenome-documents}
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4j_secure_password_2026}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    networks:
+      - mindgenome-net
+
+  # =============================================================================
+  # Celery Beat Scheduler (Periodic Maintenance & Outbox Dispatch)
+  # =============================================================================
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mindgenome_celery_beat
+    restart: unless-stopped
+    command: ["celery", "-A", "app.workers.celery_app.celery_app", "beat", "-l", "info"]
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mindgenome}:${POSTGRES_PASSWORD:-mindgenome_secure_password_2026}@postgres:5432/${POSTGRES_DB:-mindgenome}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secure_password_2026}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_secure_password_2026}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_secure_password_2026}@redis:6379/2
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - mindgenome-net
+
+networks:
+  mindgenome-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  qdrantdata:
+  neo4jdata:

@@ -1,0 +1,1166 @@
+"""The periodic task scheduler."""
+
+import copy
+import dbm
+import errno
+import heapq
+import os
+import shelve
+import socket
+import sys
+import time
+import traceback
+from calendar import timegm
+from collections import namedtuple
+from functools import total_ordering
+from pickle import UnpicklingError
+from threading import Event, Thread
+
+from billiard import ensure_multiprocessing
+from billiard.common import reset_signals
+from billiard.context import Process
+from kombu import pidbox
+from kombu.common import ignore_errors
+from kombu.utils.encoding import safe_str
+from kombu.utils.functional import maybe_evaluate, reprcall
+from kombu.utils.objects import cached_property
+
+from . import __version__, platforms, signals
+from .exceptions import reraise
+from .schedules import crontab, maybe_schedule
+from .utils.collections import AttributeDict
+from .utils.functional import is_numeric_value
+from .utils.imports import load_extension_class_names, symbol_by_name
+from .utils.log import get_logger, iter_open_logger_fds
+from .utils.nodenames import default_nodename, host_format
+from .utils.time import humanize_seconds, maybe_make_aware
+
+__all__ = (
+    'SchedulingError', 'ScheduleEntry', 'Scheduler',
+    'PersistentScheduler', 'Service', 'BeatPidbox', 'EmbeddedService',
+)
+
+event_t = namedtuple('event_t', ('time', 'priority', 'entry'))
+
+logger = get_logger(__name__)
+debug, info, error, warning = (logger.debug, logger.info,
+                               logger.error, logger.warning)
+
+DEFAULT_MAX_INTERVAL = 300  # 5 minutes
+
+
+class SchedulingError(Exception):
+    """An error occurred while scheduling a task."""
+
+
+class BeatLazyFunc:
+    """A lazy function declared in 'beat_schedule' and called before sending to worker.
+
+    Example:
+
+        beat_schedule = {
+            'test-every-5-minutes': {
+                'task': 'test',
+                'schedule': 300,
+                'kwargs': {
+                    "current": BeatCallBack(datetime.datetime.now)
+                }
+            }
+        }
+
+    """
+
+    def __init__(self, func, *args, **kwargs):
+        self._func = func
+        self._func_params = {
+            "args": args,
+            "kwargs": kwargs
+        }
+
+    def __call__(self):
+        return self.delay()
+
+    def delay(self):
+        return self._func(*self._func_params["args"], **self._func_params["kwargs"])
+
+
+@total_ordering
+class ScheduleEntry:
+    """An entry in the scheduler.
+
+    Arguments:
+        name (str): see :attr:`name`.
+        schedule (~celery.schedules.schedule): see :attr:`schedule`.
+        args (Tuple): see :attr:`args`.
+        kwargs (Dict): see :attr:`kwargs`.
+        options (Dict): see :attr:`options`.
+        last_run_at (~datetime.datetime): see :attr:`last_run_at`.
+        total_run_count (int): see :attr:`total_run_count`.
+        relative (bool): Is the time relative to when the server starts?
+    """
+
+    #: The task name
+    name = None
+
+    #: The schedule (:class:`~celery.schedules.schedule`)
+    schedule = None
+
+    #: Positional arguments to apply.
+    args = None
+
+    #: Keyword arguments to apply.
+    kwargs = None
+
+    #: Task execution options.
+    options = None
+
+    #: The time and date of when this task was last scheduled.
+    last_run_at = None
+
+    #: Total number of times this task has been scheduled.
+    total_run_count = 0
+
+    def __init__(self, name=None, task=None, last_run_at=None,
+                 total_run_count=None, schedule=None, args=(), kwargs=None,
+                 options=None, relative=False, app=None):
+        self.app = app
+        self.name = name
+        self.task = task
+        self.args = args
+        self.kwargs = kwargs if kwargs else {}
+        self.options = options if options else {}
+        self.schedule = maybe_schedule(schedule, relative, app=self.app)
+        self.last_run_at = last_run_at or self.default_now()
+        self.total_run_count = total_run_count or 0
+
+    def default_now(self):
+        return self.schedule.now() if self.schedule else self.app.now()
+    _default_now = default_now  # compat
+
+    def _next_instance(self, last_run_at=None):
+        """Return new instance, with date and count fields updated."""
+        return self.__class__(**dict(
+            self,
+            last_run_at=last_run_at or self.default_now(),
+            total_run_count=self.total_run_count + 1,
+        ))
+    __next__ = next = _next_instance  # for 2to3
+
+    def __reduce__(self):
+        return self.__class__, (
+            self.name, self.task, self.last_run_at, self.total_run_count,
+            self.schedule, self.args, self.kwargs, self.options,
+        )
+
+    def update(self, other):
+        """Update values from another entry.
+
+        Will only update "editable" fields:
+            ``task``, ``schedule``, ``args``, ``kwargs``, ``options``.
+        """
+        self.__dict__.update({
+            'task': other.task, 'schedule': other.schedule,
+            'args': other.args, 'kwargs': other.kwargs,
+            'options': other.options,
+        })
+
+    def is_due(self):
+        """See :meth:`~celery.schedules.schedule.is_due`."""
+        return self.schedule.is_due(self.last_run_at)
+
+    def __iter__(self):
+        return iter(vars(self).items())
+
+    def __repr__(self):
+        return '<{name}: {0.name} {call} {0.schedule}'.format(
+            self,
+            call=reprcall(self.task, self.args or (), self.kwargs or {}),
+            name=type(self).__name__,
+        )
+
+    def __lt__(self, other):
+        if isinstance(other, ScheduleEntry):
+            # How the object is ordered doesn't really matter, as
+            # in the scheduler heap, the order is decided by the
+            # preceding members of the tuple ``(time, priority, entry)``.
+            #
+            # If all that's left to order on is the entry then it can
+            # just as well be random.
+            return id(self) < id(other)
+        return NotImplemented
+
+    def editable_fields_equal(self, other):
+        for attr in ('task', 'args', 'kwargs', 'options', 'schedule'):
+            if getattr(self, attr) != getattr(other, attr):
+                return False
+        return True
+
+    def __eq__(self, other):
+        """Test schedule entries equality.
+
+        Will only compare "editable" fields:
+        ``task``, ``schedule``, ``args``, ``kwargs``, ``options``.
+        """
+        return self.editable_fields_equal(other)
+
+
+def _evaluate_entry_args(entry_args):
+    if not entry_args:
+        return []
+    return [
+        v() if isinstance(v, BeatLazyFunc) else v
+        for v in entry_args
+    ]
+
+
+def _evaluate_entry_kwargs(entry_kwargs):
+    if not entry_kwargs:
+        return {}
+    return {
+        k: v() if isinstance(v, BeatLazyFunc) else v
+        for k, v in entry_kwargs.items()
+    }
+
+
+class Scheduler:
+    """Scheduler for periodic tasks.
+
+    The :program:`celery beat` program may instantiate this class
+    multiple times for introspection purposes, but then with the
+    ``lazy`` argument set.  It's important for subclasses to
+    be idempotent when this argument is set.
+
+    Arguments:
+        schedule (~celery.schedules.schedule): see :attr:`schedule`.
+        max_interval (int): see :attr:`max_interval`.
+        lazy (bool): Don't set up the schedule.
+    """
+
+    Entry = ScheduleEntry
+
+    #: The schedule dict/shelve.
+    schedule = None
+
+    #: Maximum time to sleep between re-checking the schedule.
+    max_interval = DEFAULT_MAX_INTERVAL
+
+    #: How often to sync the schedule (3 minutes by default)
+    sync_every = 3 * 60
+
+    #: How many tasks can be called before a sync is forced.
+    sync_every_tasks = None
+
+    _last_sync = None
+    _tasks_since_sync = 0
+
+    logger = logger  # compat
+
+    def __init__(self, app, schedule=None, max_interval=None,
+                 Producer=None, lazy=False, sync_every_tasks=None, **kwargs):
+        self.app = app
+        self.data = maybe_evaluate({} if schedule is None else schedule)
+        self.max_interval = (max_interval or
+                             app.conf.beat_max_loop_interval or
+                             self.max_interval)
+        self.Producer = Producer or app.amqp.Producer
+        self._heap = None
+        self.old_schedulers = None
+        self.sync_every_tasks = (
+            app.conf.beat_sync_every if sync_every_tasks is None
+            else sync_every_tasks)
+        if not lazy:
+            self.setup_schedule()
+
+    def install_default_entries(self, data):
+        entries = {}
+        if self.app.conf.result_expires and \
+                not self.app.backend.supports_autoexpire:
+            if 'celery.backend_cleanup' not in data:
+                entries['celery.backend_cleanup'] = {
+                    'task': 'celery.backend_cleanup',
+                    'schedule': crontab('0', '4', '*'),
+                    'options': {'expires': 12 * 3600}}
+        self.update_from_dict(entries)
+
+    def apply_entry(self, entry, producer=None):
+        info('Scheduler: Sending due task %s (%s)', entry.name, entry.task)
+        try:
+            result = self.apply_async(entry, producer=producer, advance=False)
+        except Exception as exc:  # pylint: disable=broad-except
+            error('Message Error: %s\n%s',
+                  exc, traceback.format_stack(), exc_info=True)
+        else:
+            if result and hasattr(result, 'id'):
+                debug('%s sent. id->%s', entry.task, result.id)
+            else:
+                debug('%s sent.', entry.task)
+
+    def adjust(self, n, drift=-0.010):
+        if n and n > 0:
+            return n + drift
+        return n
+
+    def is_due(self, entry):
+        return entry.is_due()
+
+    def _is_due_failed(self, entry):
+        # One entry whose next run can't be calculated must not stop beat
+        # (and every other entry with it), so log it and try again later.
+        error('beat: Cannot calculate the next run of %r, '
+              'trying again in %s.', entry.name,
+              humanize_seconds(self.max_interval), exc_info=True)
+        return False, self.max_interval
+
+    def _when(self, entry, next_time_to_run, mktime=timegm):
+        """Return a utc timestamp, make sure heapq in correct order."""
+        adjust = self.adjust
+
+        as_now = maybe_make_aware(entry.default_now())
+
+        return (mktime(as_now.utctimetuple()) +
+                as_now.microsecond / 1e6 +
+                (adjust(next_time_to_run) or 0))
+
+    def populate_heap(self, event_t=event_t, heapify=heapq.heapify):
+        """Populate the heap with the data contained in the schedule."""
+        priority = 5
+        self._heap = []
+        for entry in self.schedule.values():
+            try:
+                is_due, next_call_delay = entry.is_due()
+            except Exception:  # pylint: disable=broad-except
+                is_due, next_call_delay = self._is_due_failed(entry)
+            self._heap.append(event_t(
+                self._when(
+                    entry,
+                    0 if is_due else next_call_delay
+                ) or 0,
+                priority, entry
+            ))
+        heapify(self._heap)
+
+    # pylint disable=redefined-outer-name
+    def tick(self, event_t=event_t, min=min, heappop=heapq.heappop,
+             heappush=heapq.heappush):
+        """Run a tick - one iteration of the scheduler.
+
+        Executes one due task per call.
+
+        Returns:
+            float: preferred delay in seconds for next call.
+        """
+        adjust = self.adjust
+        max_interval = self.max_interval
+
+        if (self._heap is None or
+                not self.schedules_equal(self.old_schedulers, self.schedule)):
+            self.old_schedulers = copy.copy(self.schedule)
+            self.populate_heap()
+
+        H = self._heap
+
+        if not H:
+            return max_interval
+
+        event = H[0]
+        entry = event[2]
+        now = self._when(entry, 0)
+        if event[0] > now:
+            return min(event[0] - now, max_interval)
+
+        try:
+            is_due, next_time_to_run = self.is_due(entry)
+        except Exception:  # pylint: disable=broad-except
+            is_due, next_time_to_run = self._is_due_failed(entry)
+        if is_due:
+            verify = heappop(H)
+            if verify is event:
+                next_entry = self.reserve(entry)
+                self.apply_entry(entry, producer=self.producer)
+                heappush(H, event_t(self._when(next_entry, next_time_to_run),
+                                    event[1], next_entry))
+                return 0
+            else:
+                heappush(H, verify)
+                return min(verify[0] - self._when(verify[2], 0), max_interval)
+
+        # Heap says this entry should be ready by now, but the entry requests
+        # to retry later.  Reheap it at that retry time, otherwise it just
+        # sits on top and the entries behind it never get their turn.
+        # https://github.com/celery/celery/issues/7649
+        reschedule_delay = next_time_to_run if is_numeric_value(next_time_to_run) else max_interval
+        verify = heappop(H)
+        if verify is event:
+            heappush(H, event_t(self._when(entry, reschedule_delay), event[1], entry))
+            # If another entry is now at the top, run it immediately.
+            return 0 if H and H[0][2] is not entry else min(adjust(reschedule_delay), max_interval)
+        else:
+            heappush(H, verify)
+            return min(verify[0] - self._when(verify[2], 0), max_interval)
+
+    def schedules_equal(self, old_schedules, new_schedules):
+        if old_schedules is new_schedules is None:
+            return True
+        if old_schedules is None or new_schedules is None:
+            return False
+        if set(old_schedules.keys()) != set(new_schedules.keys()):
+            return False
+        for name, old_entry in old_schedules.items():
+            new_entry = new_schedules.get(name)
+            if not new_entry:
+                return False
+            if new_entry != old_entry:
+                return False
+        return True
+
+    def should_sync(self):
+        return (
+            (not self._last_sync or
+             (time.monotonic() - self._last_sync) > self.sync_every) or
+            (self.sync_every_tasks and
+             self._tasks_since_sync >= self.sync_every_tasks)
+        )
+
+    def reserve(self, entry):
+        new_entry = self.schedule[entry.name] = next(entry)
+        return new_entry
+
+    def apply_async(self, entry, producer=None, advance=True, **kwargs):
+        # Update time-stamps and run counts before we actually execute,
+        # so we have that done if an exception is raised (doesn't schedule
+        # forever.)
+        entry = self.reserve(entry) if advance else entry
+        task = self.app.tasks.get(entry.task)
+
+        try:
+            entry_args = _evaluate_entry_args(entry.args)
+            entry_kwargs = _evaluate_entry_kwargs(entry.kwargs)
+
+            # Add custom header to identify tasks from Celery Beat
+            options = entry.options.copy()
+            options.setdefault('headers', {})['celery_beat_task'] = True
+
+            if task:
+                return task.apply_async(entry_args, entry_kwargs,
+                                        producer=producer,
+                                        **options)
+            else:
+                return self.send_task(entry.task, entry_args, entry_kwargs,
+                                      producer=producer,
+                                      **options)
+        except Exception as exc:  # pylint: disable=broad-except
+            reraise(SchedulingError, SchedulingError(
+                "Couldn't apply scheduled task {0.name}: {exc}".format(
+                    entry, exc=exc)), sys.exc_info()[2])
+        finally:
+            self._tasks_since_sync += 1
+            if self.should_sync():
+                self._do_sync()
+
+    def send_task(self, *args, **kwargs):
+        return self.app.send_task(*args, **kwargs)
+
+    def setup_schedule(self):
+        self.install_default_entries(self.data)
+        self.merge_inplace(self.app.conf.beat_schedule)
+
+    def _do_sync(self):
+        try:
+            debug('beat: Synchronizing schedule...')
+            self.sync()
+        finally:
+            self._last_sync = time.monotonic()
+            self._tasks_since_sync = 0
+
+    def sync(self):
+        pass
+
+    def close(self):
+        """Sync and release publishing resources; subclasses close storage.
+
+        The base publishing properties are recreated lazily on next access.
+        Resuming a subclass may require reopening storage or reacquiring locks.
+        """
+        sync_failed = True
+        try:
+            self.sync()
+            sync_failed = False
+        finally:
+            # Inspect the cache so closing an unused scheduler cannot open
+            # a broker connection. Releasing it also closes its channels.
+            self.__dict__.pop('producer', None)
+            connection = self.__dict__.pop('connection', None)
+            if connection is not None:
+                try:
+                    ignore_errors(connection, connection.release)
+                except Exception:
+                    if not sync_failed:
+                        raise
+                    error('beat: Connection cleanup failed after sync error',
+                          exc_info=True)
+
+    def add(self, **kwargs):
+        entry = self.Entry(app=self.app, **kwargs)
+        self.schedule[entry.name] = entry
+        return entry
+
+    def _maybe_entry(self, name, entry):
+        if isinstance(entry, self.Entry):
+            entry.app = self.app
+            return entry
+        return self.Entry(**dict(entry, name=name, app=self.app))
+
+    def update_from_dict(self, dict_):
+        self.schedule.update({
+            name: self._maybe_entry(name, entry)
+            for name, entry in dict_.items()
+        })
+
+    def merge_inplace(self, b):
+        schedule = self.schedule
+        A, B = set(schedule), set(b)
+
+        # Remove items from disk not in the schedule anymore.
+        for key in A ^ B:
+            schedule.pop(key, None)
+
+        # Update and add new items in the schedule
+        for key in B:
+            entry = self.Entry(**dict(b[key], name=key, app=self.app))
+            if schedule.get(key):
+                schedule[key].update(entry)
+            else:
+                schedule[key] = entry
+
+    def _ensure_connected(self):
+        # callback called for each retry while the connection
+        # can't be established.
+        def _error_handler(exc, interval):
+            error('beat: Connection error: %s. '
+                  'Trying again in %s seconds...', exc, interval)
+
+        return self.connection.ensure_connection(
+            _error_handler, self.app.conf.broker_connection_max_retries
+        )
+
+    def get_schedule(self):
+        return self.data
+
+    def set_schedule(self, schedule):
+        self.data = schedule
+    schedule = property(get_schedule, set_schedule)
+
+    @cached_property
+    def connection(self):
+        return self.app.connection_for_write()
+
+    @cached_property
+    def producer(self):
+        return self.Producer(self._ensure_connected(), auto_declare=False)
+
+    @property
+    def info(self):
+        return ''
+
+
+class PersistentScheduler(Scheduler):
+    """Scheduler backed by :mod:`shelve` database."""
+
+    persistence = shelve
+    known_suffixes = ('', '.db', '.dat', '.bak', '.dir')
+
+    _store = None
+
+    def __init__(self, *args, **kwargs):
+        self.schedule_filename = kwargs.get('schedule_filename')
+        super().__init__(*args, **kwargs)
+
+    def _remove_db(self):
+        for suffix in self.known_suffixes:
+            with platforms.ignore_errno(errno.ENOENT):
+                os.remove(self.schedule_filename + suffix)
+
+    def _open_schedule(self):
+        return self.persistence.open(self.schedule_filename, writeback=True)
+
+    def _destroy_open_corrupted_schedule(self, exc):
+        error('Removing corrupted schedule file %r: %r',
+              self.schedule_filename, exc, exc_info=True)
+        self._remove_db()
+        return self._open_schedule()
+
+    def setup_schedule(self):
+        try:
+            self._store = self._open_schedule()
+            # In some cases there may be different errors from a storage
+            # backend for corrupted files.  Example - DBPageNotFoundError
+            # exception from bsddb.  In such case the file will be
+            # successfully opened but the error will be raised on first key
+            # retrieving.
+            self._store.keys()
+        except Exception as exc:  # pylint: disable=broad-except
+            self._store = self._destroy_open_corrupted_schedule(exc)
+
+        self._create_schedule()
+
+        tz = self.app.conf.timezone
+        stored_tz = self._store.get('tz')
+        if stored_tz is not None and stored_tz != tz:
+            warning('Reset: Timezone changed from %r to %r', stored_tz, tz)
+            self._store.clear()   # Timezone changed, reset db!
+        utc = self.app.conf.enable_utc
+        stored_utc = self._store.get('utc_enabled')
+        if stored_utc is not None and stored_utc != utc:
+            choices = {True: 'enabled', False: 'disabled'}
+            warning('Reset: UTC changed from %s to %s',
+                    choices[stored_utc], choices[utc])
+            self._store.clear()   # UTC setting changed, reset db!
+        entries = self._store.setdefault('entries', {})
+        self.merge_inplace(self.app.conf.beat_schedule)
+        self.install_default_entries(self.schedule)
+        self._store.update({
+            '__version__': __version__,
+            'tz': tz,
+            'utc_enabled': utc,
+        })
+        self.sync()
+        debug('Current schedule:\n' + '\n'.join(
+            repr(entry) for entry in entries.values()))
+
+    def _create_schedule(self):
+        for _ in (1, 2):
+            try:
+                self._store['entries']
+            except (KeyError, UnicodeDecodeError, TypeError, UnpicklingError,
+                    ValueError) as exc:
+                # new schedule db, or the stored entries can't be loaded
+                # anymore (e.g. a crontab that is now invalid).
+                if isinstance(exc, ValueError):
+                    warning('DB Reset: Cannot load the stored entries, '
+                            'recreating them from beat_schedule: %r', exc)
+                try:
+                    self._store['entries'] = {}
+                except (KeyError, UnicodeDecodeError, TypeError, UnpicklingError) + dbm.error as exc:
+                    self._store = self._destroy_open_corrupted_schedule(exc)
+                    continue
+            else:
+                if '__version__' not in self._store:
+                    warning('DB Reset: Account for new __version__ field')
+                    self._store.clear()   # remove schedule at 2.2.2 upgrade.
+                elif 'tz' not in self._store:
+                    warning('DB Reset: Account for new tz field')
+                    self._store.clear()   # remove schedule at 3.0.8 upgrade
+                elif 'utc_enabled' not in self._store:
+                    warning('DB Reset: Account for new utc_enabled field')
+                    self._store.clear()   # remove schedule at 3.0.9 upgrade
+            break
+
+    def get_schedule(self):
+        return self._store['entries']
+
+    def set_schedule(self, schedule):
+        self._store['entries'] = schedule
+    schedule = property(get_schedule, set_schedule)
+
+    def sync(self):
+        if self._store is not None:
+            self._store.sync()
+
+    def close(self):
+        close_failed = True
+        try:
+            super().close()
+            close_failed = False
+        finally:
+            if self._store is not None:
+                try:
+                    self._store.close()
+                except Exception:
+                    if not close_failed:
+                        raise
+                    error('beat: Store cleanup failed after scheduler error',
+                          exc_info=True)
+
+    @property
+    def info(self):
+        return f'    . db -> {self.schedule_filename}'
+
+
+#: name half of beat's remote-control node name.
+NODENAME_DEFAULT = 'celerybeat'
+
+
+def beat_nodename(hostname=None):
+    """Return the node name beat answers remote control commands on.
+
+    The worker's own resolution with a different default name, so the
+    two cannot drift: a bare host gains the ``celerybeat`` name, and
+    ``%h``/``%n``/``%d`` expand as they do for ``celery worker -n``.
+    """
+    return host_format(default_nodename(hostname, NODENAME_DEFAULT))
+
+
+class _PidboxStopping(BaseException):
+    """Signals the consumer thread to abandon a connection attempt.
+
+    A control-flow signal rather than an error, so it subclasses
+    :exc:`BaseException`: a broad ``except Exception`` in kombu or in a
+    transport would otherwise swallow it and keep the thread retrying
+    through a shutdown.  :exc:`~celery.exceptions.WorkerShutdown` is a
+    :exc:`SystemExit` for the same reason.
+    """
+
+
+class _BeatNode(pidbox.Node):
+    """Pidbox node that stays silent while the scheduler is stalled.
+
+    The staleness check lives here rather than in the consumer callback
+    because :meth:`kombu.pidbox.Node.handle_message` only reaches
+    :meth:`dispatch` for messages actually addressed to this node.
+    Checking earlier would make beat log about every broadcast aimed at
+    a worker.
+    """
+
+    #: owning :class:`BeatPidbox`, set once it has built this node.
+    beat_pidbox = None
+
+    def dispatch(self, method, arguments=None, reply_to=None,
+                 ticket=None, **kwargs):
+        owner = self.beat_pidbox
+        if owner is not None and owner.is_stale():
+            warning('beat pidbox: not answering %s, the scheduler has '
+                    'not ticked for %.1fs (over the %ss limit).',
+                    method, owner.tick_age(), owner.max_tick_age)
+            return None
+        return super().dispatch(method, arguments, reply_to, ticket,
+                                **kwargs)
+
+
+class BeatPidbox:
+    """Remote-control mailbox node for beat.
+
+    Binds a ``celerybeat@hostname`` node to the same ``celery.pidbox``
+    fanout exchange the workers use, so that ``celery inspect ping``
+    (optionally with ``--destination``) also reaches beat.
+
+    Only the ``ping`` command is implemented; any other broadcast
+    command is ignored silently, since replying with an error would
+    pollute the output of worker-only commands like ``inspect active``.
+
+    The node stops answering once the scheduler has not ticked for
+    :attr:`max_tick_age` seconds.  Staying silent is the only signal a
+    probe can act on: :program:`celery inspect` exits non-zero when no
+    node replies, but an error *reply* still counts as a reply and
+    leaves the exit status at zero.
+    """
+
+    #: seconds to pause before reconnecting after an established
+    #: connection is lost.  Establishing a connection is governed by
+    #: :setting:`broker_connection_retry` and
+    #: :setting:`broker_connection_max_retries` instead.
+    retry_interval = 5.0
+
+    #: seconds to wait for the thread to terminate in :meth:`stop`.
+    join_timeout = 3.0
+
+    #: floor for the derived :attr:`max_tick_age`.  A scheduler with a
+    #: short loop interval (django-celery-beat's is five seconds) would
+    #: otherwise get a window so tight that one slow pass looks like a
+    #: stall, and on a liveness probe that means restart loops.
+    min_tick_age = 60.0
+
+    def __init__(self, service):
+        self.service = service
+        self.app = service.app
+        self.hostname = beat_nodename(service.hostname)
+        self.state = AttributeDict(app=self.app, service=service)
+        self.node = _BeatNode(
+            safe_str(self.hostname),
+            state=self.state,
+            handlers={'ping': self._ping},
+            mailbox=self.app.control.mailbox,
+        )
+        self.node.beat_pidbox = self
+        self.thread = None
+        #: mirrors the worker: the first attempt is governed by
+        #: broker_connection_retry_on_startup, later ones by
+        #: broker_connection_retry.
+        self.first_connection_attempt = True
+        self._shutdown = Event()
+
+    @property
+    def max_tick_age(self):
+        """Seconds a tick may be overdue before beat stops replying.
+
+        Falls back to twice the interval the scheduler actually settled
+        on -- which a scheduler class may choose itself, so it is not
+        always :setting:`beat_max_loop_interval` -- with
+        :attr:`min_tick_age` as a floor.  ``0`` disables the check.
+
+        The service records that interval on the main thread once the
+        scheduler exists, because the scheduler is a lazy attribute and
+        this runs on the consumer thread, which must not build it.
+        """
+        configured = self.app.conf.beat_remote_control_max_tick_age
+        if configured is not None:
+            return configured
+        interval = (self.service.effective_max_interval or
+                    self.service.max_interval or DEFAULT_MAX_INTERVAL)
+        return max(interval * 2, self.min_tick_age)
+
+    def tick_age(self):
+        # Read of a single float attribute written by the scheduler
+        # thread.  That is atomic under CPython, so no lock is needed --
+        # but keep it a plain attribute for that reason: splitting it
+        # into two fields would need one.
+        last_tick = self.service._last_tick
+        if last_tick is None:
+            return None
+        return time.monotonic() - last_tick
+
+    def is_stale(self):
+        max_tick_age = self.max_tick_age
+        if not max_tick_age:
+            return False
+        tick_age = self.tick_age()
+        return tick_age is not None and tick_age > max_tick_age
+
+    def _ping(self, state, **_kwargs):
+        return {'ok': 'pong'}
+
+    def on_message(self, body, message):
+        try:
+            if not isinstance(body, dict):
+                return
+            if body.get('method') not in self.node.handlers:
+                return
+            self.node.handle_message(body, message)
+        except Exception as exc:  # pylint: disable=broad-except
+            error('beat pidbox command error: %r', exc, exc_info=True)
+
+    def fanout_support(self):
+        """Return ``(supported, transport_name)`` for the read transport.
+
+        Reads the transport's declared capabilities, so no connection is
+        opened and this is safe to call before starting the thread.  The
+        name comes back with the answer rather than from a second
+        throwaway connection built to format the warning.
+        """
+        connection = self.app.connection_for_read()
+        try:
+            return (connection.supports_exchange_type('fanout'),
+                    connection.transport_cls)
+        finally:
+            ignore_errors(connection, connection.release)
+
+    def start(self):
+        if self.thread is not None and self.thread.is_alive():
+            return
+        supported, transport = self.fanout_support()
+        if not supported:
+            # Without fanout, node.listen() fails on every attempt.  The
+            # reconnect loop cannot tell that apart from a connection
+            # that dropped, so it would retry forever, once per
+            # retry_interval, for the life of the process.
+            warning('beat pidbox: the %s transport has no fanout '
+                    'exchanges, so remote control is unavailable.',
+                    transport)
+            return
+        self.first_connection_attempt = True
+        self._shutdown.clear()
+        self.thread = Thread(
+            target=self._loop, name='BeatPidbox', daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        # If the join times out the thread is left running while beat
+        # finishes shutting down.  That is survivable: the thread is a
+        # daemon, so it never holds up interpreter exit, and it owns the
+        # connection it is draining -- the scheduler's own connection is
+        # separate, so closing that cannot pull the socket out from
+        # under it.  Worst case it wakes from drain_events into a
+        # half-torn-down interpreter, where the broad except in _loop
+        # catches whatever comes back.
+        self._shutdown.set()
+        if self.thread is not None:
+            self.thread.join(timeout=self.join_timeout)
+            if self.thread.is_alive():
+                warning('beat pidbox: consumer thread did not stop '
+                        'within %s seconds, most likely waiting on a '
+                        'broker connection that is not answering. It '
+                        'is a daemon thread and will not hold up exit.',
+                        self.join_timeout)
+            else:
+                self.thread = None
+
+    def _error_handler(self, exc, interval):
+        error('beat pidbox: Connection error: %s. '
+              'Trying again in %s seconds...', exc, interval)
+
+    def _abort_if_stopping(self):
+        # kombu calls this once a second while it backs off, which is
+        # the only chance to notice a stop() during a long retry.
+        # Without it a shutdown waits out the whole backoff and then
+        # warns that the thread would not die.
+        if self._shutdown.is_set():
+            raise _PidboxStopping()
+
+    def _connection_retry_setting(self):
+        """Name of the setting governing the attempt about to be made.
+
+        The worker governs its first connection with
+        :setting:`broker_connection_retry_on_startup` and everything
+        after it with :setting:`broker_connection_retry`, falling back
+        to the latter when the startup setting is unset.  Beat's control
+        thread follows the same rule, so that someone who asked to fail
+        fast at startup gets that here too.
+        """
+        conf = self.app.conf
+        if (self.first_connection_attempt
+                and conf.broker_connection_retry_on_startup is not None):
+            return 'broker_connection_retry_on_startup'
+        return 'broker_connection_retry'
+
+    def _connect(self):
+        # A dedicated connection: broker connections must not be
+        # shared with the scheduler thread.
+        conf = self.app.conf
+        retry_setting = self._connection_retry_setting()
+        self.first_connection_attempt = False
+        connection = self.app.connection_for_read()
+        try:
+            connection.ensure_connection(
+                self._error_handler,
+                conf.broker_connection_max_retries
+                if conf[retry_setting] else 0,
+                callback=self._abort_if_stopping,
+            )
+        except BaseException:
+            # Broad on purpose: _PidboxStopping is not an Exception,
+            # and the connection never entered the context manager, so
+            # it has to be released here however the attempt failed.
+            ignore_errors(connection, connection.release)
+            raise
+        return connection
+
+    def _consume_from(self, connection):
+        shutdown = self._shutdown
+        info('beat pidbox: Connected to %s.', connection.as_uri())
+        self.node.channel = connection.channel()
+        consumer = self.node.listen(callback=self.on_message)
+        try:
+            while not shutdown.is_set():
+                try:
+                    connection.drain_events(timeout=1.0)
+                except socket.timeout:
+                    pass
+        finally:
+            ignore_errors(connection, consumer.cancel)
+
+    def _loop(self):
+        shutdown = self._shutdown
+        try:
+            while not shutdown.is_set():
+                try:
+                    established = self._connect()
+                except _PidboxStopping:
+                    break
+                except Exception as exc:  # pylint: disable=broad-except
+                    if shutdown.is_set():
+                        break
+                    # ensure_connection() has already applied
+                    # whatever policy was configured.  Looping back
+                    # would hand it a fresh budget and make
+                    # broker_connection_max_retries meaningless, so
+                    # stop here.  One message whatever the cause: how
+                    # far the attempt got depends on the error, on
+                    # whether retrying was enabled and on the size of
+                    # the budget, so name the settings and leave the
+                    # traceback to say the rest.
+                    error('beat pidbox: could not connect to the '
+                          'broker, so beat will not answer remote '
+                          'control commands for the life of this '
+                          'process. See broker_connection_retry, '
+                          'broker_connection_retry_on_startup and '
+                          'broker_connection_max_retries: %r',
+                          exc, exc_info=True)
+                    break
+                try:
+                    with established as connection:
+                        self._consume_from(connection)
+                except Exception as exc:  # pylint: disable=broad-except
+                    if shutdown.is_set():
+                        break
+                    error('beat pidbox connection error: %r', exc,
+                          exc_info=True)
+                    if not self.app.conf.broker_connection_retry:
+                        # The setting governs reconnecting to a broker
+                        # that went away, not just the first attempt.
+                        break
+                    # A connection that was up and dropped is worth
+                    # re-establishing, with a fresh budget of its own.
+                    shutdown.wait(self.retry_interval)
+        finally:
+            if not shutdown.is_set():
+                warning('beat pidbox: Consumer stopped, beat will no '
+                        'longer answer remote control commands.')
+
+
+class Service:
+    """Celery periodic task service."""
+
+    scheduler_cls = PersistentScheduler
+
+    def __init__(self, app, max_interval=None, schedule_filename=None,
+                 scheduler_cls=None, remote_control=None, hostname=None):
+        self.app = app
+        self.max_interval = (max_interval or
+                             app.conf.beat_max_loop_interval)
+        self.scheduler_cls = scheduler_cls or self.scheduler_cls
+        self.schedule_filename = (
+            schedule_filename or app.conf.beat_schedule_filename)
+        self.remote_control = (
+            app.conf.beat_enable_remote_control
+            if remote_control is None else remote_control)
+        self.hostname = hostname
+
+        #: interval the scheduler settled on, recorded once it exists so
+        #: the pidbox thread never has to build the lazy attribute.
+        self.effective_max_interval = None
+        self._pidbox = None
+        #: monotonic timestamp of the last scheduler pass, read by the
+        #: pidbox thread to decide whether beat is still ticking.
+        self._last_tick = None
+        self._is_shutdown = Event()
+        self._is_stopped = Event()
+
+    def __reduce__(self):
+        return self.__class__, (self.app, self.max_interval,
+                                self.schedule_filename, self.scheduler_cls,
+                                self.remote_control, self.hostname)
+
+    def start(self, embedded_process=False):
+        info('beat: Starting...')
+        debug('beat: Ticking with max interval->%s',
+              humanize_seconds(self.scheduler.max_interval))
+
+        signals.beat_init.send(sender=self)
+        if embedded_process:
+            signals.beat_embedded_init.send(sender=self)
+            platforms.set_process_title('celery beat')
+
+        self.effective_max_interval = self.scheduler.max_interval
+
+        if self.remote_control:
+            self._pidbox = BeatPidbox(self)
+            self._pidbox.start()
+
+        # Stamp before the first pass, so a beat that wedges before it
+        # ever ticks goes stale rather than looking perpetually healthy.
+        self._last_tick = time.monotonic()
+
+        try:
+            while not self._is_shutdown.is_set():
+                interval = self.scheduler.tick()
+                self._last_tick = time.monotonic()
+                if interval and interval > 0.0:
+                    debug('beat: Waking up %s.',
+                          humanize_seconds(interval, prefix='in '))
+                    time.sleep(interval)
+                    if self.scheduler.should_sync():
+                        self.scheduler._do_sync()
+        except (KeyboardInterrupt, SystemExit):
+            self._is_shutdown.set()
+        finally:
+            # Persist the schedule before spending time joining the
+            # pidbox thread: a supervisor may follow SIGTERM with
+            # SIGKILL, and the schedule is the state worth keeping.
+            self.sync()
+            if self._pidbox is not None:
+                self._pidbox.stop()
+
+    def sync(self):
+        self.scheduler.close()
+        self._is_stopped.set()
+
+    def stop(self, wait=False):
+        info('beat: Shutting down...')
+        self._is_shutdown.set()
+        wait and self._is_stopped.wait()  # block until shutdown done.
+
+    def get_scheduler(self, lazy=False,
+                      extension_namespace='celery.beat_schedulers'):
+        filename = self.schedule_filename
+        aliases = dict(load_extension_class_names(extension_namespace))
+        return symbol_by_name(self.scheduler_cls, aliases=aliases)(
+            app=self.app,
+            schedule_filename=filename,
+            max_interval=self.max_interval,
+            lazy=lazy,
+        )
+
+    @cached_property
+    def scheduler(self):
+        return self.get_scheduler()
+
+
+class _Threaded(Thread):
+    """Embedded task scheduler using threading."""
+
+    def __init__(self, app, **kwargs):
+        super().__init__()
+        self.app = app
+        self.service = Service(app, **kwargs)
+        self.daemon = True
+        self.name = 'Beat'
+
+    def run(self):
+        self.app.set_current()
+        self.service.start()
+
+    def stop(self):
+        self.service.stop(wait=True)
+
+
+try:
+    ensure_multiprocessing()
+except NotImplementedError:     # pragma: no cover
+    _Process = None
+else:
+    class _Process(Process):
+
+        def __init__(self, app, **kwargs):
+            super().__init__()
+            self.app = app
+            self.service = Service(app, **kwargs)
+            self.name = 'Beat'
+
+        def run(self):
+            reset_signals(full=False)
+            platforms.close_open_fds([
+                sys.__stdin__, sys.__stdout__, sys.__stderr__,
+            ] + list(iter_open_logger_fds()))
+            self.app.set_default()
+            self.app.set_current()
+            self.service.start(embedded_process=True)
+
+        def stop(self):
+            self.service.stop()
+            self.terminate()
+
+
+def EmbeddedService(app, max_interval=None, **kwargs):
+    """Return embedded clock service.
+
+    Arguments:
+        thread (bool): Run threaded instead of as a separate process.
+            Uses :mod:`multiprocessing` by default, if available.
+    """
+    # Off by default: the surrounding worker already has a
+    # remote-control node answering for this process.
+    kwargs.setdefault('remote_control', False)
+    if kwargs.pop('thread', False) or _Process is None:
+        # Need short max interval to be able to stop thread
+        # in reasonable time.
+        return _Threaded(app, max_interval=1, **kwargs)
+    return _Process(app, max_interval=max_interval, **kwargs)

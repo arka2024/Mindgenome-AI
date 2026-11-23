@@ -1,0 +1,560 @@
+"""App utilities: Compat settings, bug-report tool, pickling apps."""
+import os
+import platform as _platform
+import re
+from collections import namedtuple
+from collections.abc import Mapping
+from copy import deepcopy
+from types import ModuleType
+
+from celery.exceptions import ImproperlyConfigured
+from celery.platforms import pyimplementation
+from celery.utils.collections import ConfigurationView
+from celery.utils.imports import import_from_cwd, qualname, symbol_by_name
+from celery.utils.text import pretty
+
+from .defaults import _OLD_DEFAULTS, _OLD_SETTING_KEYS, _TO_NEW_KEY, _TO_OLD_KEY, DEFAULTS, SETTING_KEYS, find
+
+__all__ = (
+    'Settings', 'appstr', 'bugreport',
+    'filter_hidden_settings', 'find_app', 'sanitize_url',
+)
+
+#: Format used to generate bug-report information.
+BUGREPORT_INFO = """
+software -> celery:{celery_v} kombu:{kombu_v} py:{py_v}
+            billiard:{billiard_v} {driver_v}
+platform -> system:{system} arch:{arch}
+            kernel version:{kernel_version} imp:{py_i}
+loader   -> {loader}
+settings -> transport:{transport} results:{results}
+
+{human_settings}
+"""
+
+HIDDEN_SETTINGS = re.compile(
+    'API|TOKEN|KEY|SECRET|PASS|PROFANITIES_LIST|SIGNATURE|DATABASE|BEAT_DBURI',
+    re.IGNORECASE,
+)
+
+E_MIX_OLD_INTO_NEW = """
+
+Cannot mix new and old setting keys, please rename the
+following settings to the new format:
+
+{renames}
+
+"""
+
+E_MIX_NEW_INTO_OLD = """
+
+Cannot mix new setting names with old setting names, please
+rename the following settings to use the old format:
+
+{renames}
+
+Or change all of the settings to use the new format :)
+
+"""
+
+FMT_REPLACE_SETTING = '{replace:<36} -> {with_}'
+
+
+def appstr(app):
+    """String used in __repr__ etc, to id app instances."""
+    return f'{app.main or "__main__"} at {id(app):#x}'
+
+
+class Settings(ConfigurationView):
+    """Celery settings object.
+
+    .. seealso:
+
+        :ref:`configuration` for a full list of configuration keys.
+
+    """
+
+    def __init__(self, *args, deprecated_settings=None, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.deprecated_settings = deprecated_settings
+
+    def copy(self):
+        self.finalize()
+        copied = super().copy()
+        if 'deprecated_settings' in self.changes:
+            copied.changes['deprecated_settings'] = (
+                self.changes['deprecated_settings']
+            )
+        else:
+            copied.changes.pop('deprecated_settings', None)
+        return copied
+    __copy__ = copy
+
+    @property
+    def broker_read_url(self):
+        return (
+            os.environ.get('CELERY_BROKER_READ_URL') or
+            self.get('broker_read_url') or
+            self.broker_url
+        )
+
+    @property
+    def broker_write_url(self):
+        return (
+            os.environ.get('CELERY_BROKER_WRITE_URL') or
+            self.get('broker_write_url') or
+            self.broker_url
+        )
+
+    @property
+    def broker_url(self):
+        return (
+            os.environ.get('CELERY_BROKER_URL') or
+            self.first('broker_url', 'broker_host')
+        )
+
+    @property
+    def result_backend(self):
+        return (
+            os.environ.get('CELERY_RESULT_BACKEND') or
+            self.first('result_backend', 'CELERY_RESULT_BACKEND')
+        )
+
+    @property
+    def task_default_exchange(self):
+        return self.first(
+            'task_default_exchange',
+            'task_default_queue',
+        )
+
+    @property
+    def task_default_routing_key(self):
+        return self.first(
+            'task_default_routing_key',
+            'task_default_queue',
+        )
+
+    @property
+    def timezone(self):
+        # this way we also support django's time zone.
+        return self.first('timezone', 'TIME_ZONE')
+
+    def without_defaults(self):
+        """Return the current configuration, but without defaults."""
+        # the last stash is the default settings, so just skip that
+        return Settings({}, self.maps[:-1])
+
+    def value_set_for(self, key):
+        self.finalize()
+        # Also find settings given with a namespace or an old setting name.
+        return key in Settings({}, self.maps[:-1], self._keys, self.prefix)
+
+    def find_option(self, name, namespace=''):
+        """Search for option by name.
+
+        Example:
+            >>> from proj.celery import app
+            >>> app.conf.find_option('disable_rate_limits')
+            ('worker', 'prefetch_multiplier',
+             <Option: type->bool default->False>))
+
+        Arguments:
+            name (str): Name of option, cannot be partial.
+            namespace (str): Preferred name-space (``None`` by default).
+        Returns:
+            Tuple: of ``(namespace, key, type)``.
+        """
+        return find(name, namespace)
+
+    def find_value_for_key(self, name, namespace='celery'):
+        """Shortcut to ``get_by_parts(*find_option(name)[:-1])``."""
+        return self.get_by_parts(*self.find_option(name, namespace)[:-1])
+
+    def get_by_parts(self, *parts):
+        """Return the current value for setting specified as a path.
+
+        Example:
+            >>> from proj.celery import app
+            >>> app.conf.get_by_parts('worker', 'disable_rate_limits')
+            False
+        """
+        return self['_'.join(part for part in parts if part)]
+
+    def finalize(self):
+        # See PendingConfiguration in celery/app/base.py
+        # first access will read actual configuration.
+        try:
+            self['__bogus__']
+        except KeyError:
+            pass
+        return self
+
+    def table(self, with_defaults=False, censored=True):
+        filt = filter_hidden_settings if censored else lambda v: v
+        dict_members = dir(dict)
+        self.finalize()
+        settings = self if with_defaults else self.without_defaults()
+        return filt({
+            k: v for k, v in settings.items()
+            if not k.startswith('_') and k not in dict_members
+        })
+
+    def humanize(self, with_defaults=False, censored=True):
+        """Return a human readable text showing configuration changes."""
+        return '\n'.join(
+            f'{key}: {pretty(value, width=50)}'
+            for key, value in self.table(with_defaults, censored).items())
+
+    def maybe_warn_deprecated_settings(self):
+        # TODO: Remove this method in Celery 6.0
+        if self.deprecated_settings:
+            from celery.app.defaults import _TO_NEW_KEY
+            from celery.utils import deprecated
+            for setting in self.deprecated_settings:
+                deprecated.warn(description=f'The {setting!r} setting',
+                                removal='6.0.0',
+                                alternative=f'Use the {_TO_NEW_KEY[setting]} instead')
+
+            return True
+
+        return False
+
+
+def _new_key_to_old(key, convert=_TO_OLD_KEY.get):
+    return convert(key, key)
+
+
+def _old_key_to_new(key, convert=_TO_NEW_KEY.get):
+    return convert(key, key)
+
+
+_settings_info_t = namedtuple('settings_info_t', (
+    'defaults', 'convert', 'key_t', 'mix_error',
+))
+
+_settings_info = _settings_info_t(
+    DEFAULTS, _TO_NEW_KEY, _old_key_to_new, E_MIX_OLD_INTO_NEW,
+)
+_old_settings_info = _settings_info_t(
+    _OLD_DEFAULTS, _TO_OLD_KEY, _new_key_to_old, E_MIX_NEW_INTO_OLD,
+)
+
+
+def detect_settings(conf, preconf=None, ignore_keys=None, prefix=None,
+                    all_keys=None, old_keys=None):
+    preconf = {} if not preconf else preconf
+    ignore_keys = set() if not ignore_keys else ignore_keys
+    all_keys = SETTING_KEYS if not all_keys else all_keys
+    old_keys = _OLD_SETTING_KEYS if not old_keys else old_keys
+
+    source = conf
+    if conf is None:
+        source, conf = preconf, {}
+    have = set(source.keys()) - ignore_keys
+    is_in_new = have.intersection(all_keys)
+    is_in_old = have.intersection(old_keys)
+
+    info = None
+    if is_in_new:
+        # have new setting names
+        info, left = _settings_info, is_in_old
+        if is_in_old and len(is_in_old) > len(is_in_new):
+            # Majority of the settings are old.
+            info, left = _old_settings_info, is_in_new
+    if is_in_old:
+        # have old setting names, or a majority of the names are old.
+        if not info:
+            info, left = _old_settings_info, is_in_new
+        if is_in_new and len(is_in_new) > len(is_in_old):
+            # Majority of the settings are new
+            info, left = _settings_info, is_in_old
+    else:
+        # no settings, just use new format.
+        info, left = _settings_info, is_in_old
+
+    if prefix:
+        # always use new format if prefix is used.
+        info, left = _settings_info, set()
+
+    # only raise error for keys that the user didn't provide two keys
+    # for (e.g., both ``result_expires`` and ``CELERY_TASK_RESULT_EXPIRES``).
+    really_left = {key for key in left if info.convert[key] not in have}
+    if really_left:
+        # user is mixing old/new, or new/old settings, give renaming
+        # suggestions.
+        raise ImproperlyConfigured(info.mix_error.format(renames='\n'.join(
+            FMT_REPLACE_SETTING.format(replace=key, with_=info.convert[key])
+            for key in sorted(really_left)
+        )))
+
+    preconf = {info.convert.get(k, k): v for k, v in preconf.items()}
+    defaults = deepcopy(info.defaults)
+    return Settings(
+        preconf, [conf, defaults],
+        (_old_key_to_new, _new_key_to_old),
+        deprecated_settings=is_in_old,
+        prefix=prefix,
+    )
+
+
+class AppPickler:
+    """Old application pickler/unpickler (< 3.1)."""
+
+    def __call__(self, cls, *args):
+        kwargs = self.build_kwargs(*args)
+        app = self.construct(cls, **kwargs)
+        self.prepare(app, **kwargs)
+        return app
+
+    def prepare(self, app, **kwargs):
+        app.conf.update(kwargs['changes'])
+
+    def build_kwargs(self, *args):
+        return self.build_standard_kwargs(*args)
+
+    def build_standard_kwargs(self, main, changes, loader, backend, amqp,
+                              events, log, control, accept_magic_kwargs,
+                              config_source=None, config_source_silent=False):
+        return {'main': main, 'loader': loader, 'backend': backend,
+                'amqp': amqp, 'changes': changes, 'events': events,
+                'log': log, 'control': control, 'set_as_current': False,
+                'config_source': config_source,
+                'config_source_silent': config_source_silent}
+
+    def construct(self, cls, **kwargs):
+        return cls(**kwargs)
+
+
+def _unpickle_app(cls, pickler, *args):
+    """Rebuild app for versions 2.5+."""
+    return pickler()(cls, *args)
+
+
+def _unpickle_app_v2(cls, kwargs):
+    """Rebuild app for versions 3.1+."""
+    kwargs['set_as_current'] = False
+    return cls(**kwargs)
+
+
+def _redact_azure_connection_string(connection_string, mask='**'):
+    """Redact sensitive credentials in Azure Storage connection strings.
+
+    Azure connection strings use semicolon-separated key=value pairs.
+    This function redacts known secret keys while preserving other fields.
+
+    Args:
+        connection_string: The Azure connection string to redact.
+        mask: The mask string to replace secrets with (default: '**').
+
+    Returns:
+        The redacted connection string with AccountKey and SharedAccessSignature
+        values replaced by the mask.
+    """
+    # Azure matches connection string keys case-insensitively
+    secret_keys = {'accountkey', 'sharedaccesssignature'}
+    redacted_parts = []
+    for part in connection_string.split(';'):
+        key, sep, value = part.partition('=')
+        if sep and key.strip().lower() in secret_keys:
+            # Redact the entire value of secret keys
+            part = f'{key}={mask}'
+        else:
+            # Redact sig parameters in endpoint URLs (case-insensitive)
+            # Pattern: (?|&)sig=VALUE, preserving the parameter name and separator
+            if value:
+                # Use case-insensitive regex to find and redact sig parameters
+                value = re.sub(r'([?&]sig=)[^&;#]*', r'\1' + mask, value, flags=re.IGNORECASE)
+                part = f'{key}={value}'
+        redacted_parts.append(part)
+
+    return ';'.join(redacted_parts)
+
+
+def sanitize_url(url, mask='*' * 8):
+    """Sanitize URL, masking passwords.
+
+    Supports:
+    - Standard single-server URLs (e.g. ``redis://:secret@localhost:6379/0``)
+    - Passwords containing separators such as semicolons or commas
+    - Multi-server URLs with shared scheme (e.g. ``cache+memcached://user:secret@s1:11211;s2:11211/``)
+    - Redis Sentinel multi-node URLs (e.g. ``sentinel://:secret@h1:26379;sentinel://:secret@h2:26379/0``
+      or ``sentinel://:secret@h1:26379;h2:26379/0``)
+    - URLs with query strings containing semicolons (e.g. ``redis://user:secret@localhost:6379?a=1;b=2``)
+    - Azure Storage connection strings (e.g. ``azureblockblob://AccountKey=SECRET;...``)
+
+    Fails closed on malformed URLs to prevent credential leakage.
+    """
+    if not url or not isinstance(url, str):
+        return url
+
+    def _mask_uinfo(uinfo):
+        if ':' in uinfo:
+            user, _, _ = uinfo.partition(':')
+            return f'{user}:{mask}'
+        return uinfo
+
+    try:
+        if '://' not in url:
+            return url
+
+        # If it is a semicolon-separated list of full URLs (e.g. sentinel://...;sentinel://...)
+        parts = url.split(';')
+        if len(parts) > 1 and any('://' in p for p in parts[1:]):
+            return ';'.join(sanitize_url(p.strip(), mask=mask) for p in parts)
+
+        scheme, _, rest = url.partition('://')
+
+        # Azure connection strings use semicolon-separated key=value pairs
+        # Handle them specially before generic URL parsing
+        if scheme == 'azureblockblob':
+            # For Azure, treat the entire remainder as the connection string
+            # Azure connection strings can contain ? and # within SAS tokens or endpoint URLs
+            # so we must not split at these characters
+            redacted_connection_string = _redact_azure_connection_string(rest, mask=mask)
+            return f'{scheme}://{redacted_connection_string}'
+
+        # Separate authority from path/query/fragment
+        idx = len(rest)
+        for sep in ('/', '?', '#'):
+            pos = rest.find(sep)
+            if pos != -1 and pos < idx:
+                idx = pos
+        authority = rest[:idx]
+        tail = rest[idx:]
+
+        if '@' not in authority:
+            # No credentials in authority: clean empty chunks if multi-host
+            host_sep = ';' if ';' in authority else (',' if ',' in authority else None)
+            if host_sep:
+                h_list = [h.strip() for h in authority.split(host_sep) if h.strip()]
+                return f'{scheme}://{host_sep.join(h_list)}{tail}'
+            return f'{scheme}://{authority}{tail}'
+
+        uinfo, _, host_part = authority.rpartition('@')
+
+        server_sep = ';' if ';' in authority else (',' if ',' in authority else None)
+
+        is_multiserver = False
+        if server_sep:
+            raw_chunks = [c.strip() for c in authority.split(server_sep) if c.strip()]
+            if len(raw_chunks) > 1:
+                has_corrupt_chunk = any(c.startswith(':') for c in raw_chunks if '@' not in c)
+                has_at_without_colon = any(':' not in c.rpartition('@')[0] for c in raw_chunks if '@' in c)
+                if not has_corrupt_chunk and not has_at_without_colon:
+                    is_multiserver = True
+
+        if not is_multiserver:
+            if authority.count('@') > 1 and ':' not in uinfo:
+                return f'{scheme}://{mask}@{host_part}{tail}'
+            sanitized_uinfo = _mask_uinfo(uinfo)
+            return f'{scheme}://{sanitized_uinfo}@{host_part}{tail}'
+
+        servers = [c.strip() for c in authority.split(server_sep) if c.strip()]
+        sanitized_servers = []
+        for s in servers:
+            if '@' in s:
+                u, _, h = s.rpartition('@')
+                sanitized_servers.append(f'{_mask_uinfo(u)}@{h}')
+            else:
+                sanitized_servers.append(s)
+
+        sanitized_authority = server_sep.join(sanitized_servers)
+        return f'{scheme}://{sanitized_authority}{tail}'
+
+    except Exception:
+        if isinstance(url, str) and '@' in url and '://' in url:
+            import re
+            return re.sub(r'(://[^:@/]*:)([^@/]*)(@)', r'\g<1>' + mask + r'\3', url)
+        return '<unparsable url>'
+
+
+def filter_hidden_settings(conf):
+    """Filter sensitive settings."""
+    def maybe_censor(key, value, mask='*' * 8):
+        if isinstance(value, Mapping):
+            return filter_hidden_settings(value)
+        if isinstance(key, str):
+            if HIDDEN_SETTINGS.search(key):
+                return mask
+            elif key.lower() in ('broker_url', 'broker_read_url', 'broker_write_url'):
+                from kombu import Connection
+                return Connection(value).as_uri(mask=mask)
+            elif 'backend' in key.lower():
+                return sanitize_url(value, mask=mask)
+
+        return value
+
+    return {k: maybe_censor(k, v) for k, v in conf.items()}
+
+
+def bugreport(app):
+    """Return a string containing information useful in bug-reports."""
+    import billiard
+    import kombu
+
+    import celery
+
+    try:
+        conn = app.connection()
+        driver_v = '{}:{}'.format(conn.transport.driver_name,
+                                  conn.transport.driver_version())
+        transport = conn.transport_cls
+    except Exception:  # pylint: disable=broad-except
+        transport = driver_v = ''
+
+    return BUGREPORT_INFO.format(
+        system=_platform.system(),
+        arch=', '.join(x for x in _platform.architecture() if x),
+        kernel_version=_platform.release(),
+        py_i=pyimplementation(),
+        celery_v=celery.VERSION_BANNER,
+        kombu_v=kombu.__version__,
+        billiard_v=billiard.__version__,
+        py_v=_platform.python_version(),
+        driver_v=driver_v,
+        transport=transport,
+        results=sanitize_url(app.conf.result_backend or 'disabled'),
+        human_settings=app.conf.humanize(),
+        loader=qualname(app.loader.__class__),
+    )
+
+
+def find_app(app, symbol_by_name=symbol_by_name, imp=import_from_cwd):
+    """Find app by name."""
+    from .base import Celery
+
+    try:
+        sym = symbol_by_name(app, imp=imp)
+    except AttributeError:
+        # last part was not an attribute, but a module
+        sym = imp(app)
+    if isinstance(sym, ModuleType) and ':' not in app:
+        try:
+            found = sym.app
+            if isinstance(found, ModuleType):
+                raise AttributeError()
+        except AttributeError:
+            try:
+                found = sym.celery
+                if isinstance(found, ModuleType):
+                    raise AttributeError(
+                        "attribute 'celery' is the celery module not the instance of celery")
+            except AttributeError:
+                if getattr(sym, '__path__', None):
+                    try:
+                        return find_app(
+                            f'{app}.celery',
+                            symbol_by_name=symbol_by_name, imp=imp,
+                        )
+                    except ImportError:
+                        pass
+                for suspect in vars(sym).values():
+                    if isinstance(suspect, Celery):
+                        return suspect
+                raise
+            else:
+                return found
+        else:
+            return found
+    return sym
