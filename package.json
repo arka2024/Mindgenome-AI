@@ -1,0 +1,9 @@
+{
+  "name": "mindgenome-deploy",
+  "private": true,
+  "scripts": {
+    "install:frontend": "npm ci --prefix Mindgenome-AI-main/frontend",
+    "build": "npm run build --prefix Mindgenome-AI-main/frontend",
+    "start": "npm run start --prefix Mindgenome-AI-main/frontend"
+  }
+}
