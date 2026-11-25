@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --mg-canvas: #f4f0e8;
+  --mg-surface: #fffbf5;
+  --mg-ink: #1c2321;
+  --mg-muted: #5c6560;
+  --mg-line: #d9d0c4;
+  --mg-helix: #0f6e6b;
+  --mg-copper: #b86b3d;
+  --mg-danger: #b42318;
+  --mg-beginner: #c45c26;
+  --mg-developing: #b8860b;
+  --mg-proficient: #2f7d6d;
+  --mg-mastered: #1b5e8a;
+  color-scheme: light;
+}
+
+.dark {
+  --mg-canvas: #101614;
+  --mg-surface: #18201d;
+  --mg-ink: #e8ede9;
+  --mg-muted: #9aa59e;
+  --mg-line: #2c3833;
+  --mg-helix: #4ecdc4;
+  --mg-copper: #e09a6a;
+  --mg-danger: #f97066;
+  --mg-beginner: #e07a3d;
+  --mg-developing: #e2b340;
+  --mg-proficient: #5dbaa8;
+  --mg-mastered: #6cb3e0;
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--mg-canvas);
+  color: var(--mg-ink);
+  font-family: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--mg-helix);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
