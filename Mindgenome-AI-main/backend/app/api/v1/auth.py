@@ -78,14 +78,19 @@ async def refresh_tokens(
     return await service.refresh_tokens(req.refresh_token, user_agent=user_agent, ip_address=ip)
 
 
-@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+    response_class=Response,
+)
 async def logout(
     req: RefreshRequest,
     session: AsyncSession = Depends(get_db),
-) -> None:
+) -> Response:
     service = AuthService(session)
     await service.logout(req.refresh_token)
-    return None
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/me", response_model=UserResponse)

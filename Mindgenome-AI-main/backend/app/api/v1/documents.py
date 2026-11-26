@@ -7,6 +7,7 @@ from fastapi import (
     File,
     Header,
     Query,
+    Response,
     UploadFile,
     status,
 )
@@ -73,15 +74,20 @@ async def get_document(
     return await service.get_document(user=user, document_id=document_id)
 
 
-@router.delete("/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/documents/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+    response_class=Response,
+)
 async def delete_document(
     document_id: uuid.UUID,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
-) -> None:
+) -> Response:
     service = DocumentService(session)
     await service.delete_document(user=user, document_id=document_id)
-    return None
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/documents/{document_id}/status", response_model=IngestionJobResponse)

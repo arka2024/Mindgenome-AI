@@ -35,7 +35,8 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH" \
-    PORT=8000
+    PORT=10000 \
+    WEB_CONCURRENCY=1
 
 # Install runtime dependencies only
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -60,9 +61,9 @@ RUN mkdir -p /app/storage && chown -R appuser:mindgenome /app/storage
 
 USER appuser
 
-EXPOSE 8000
+EXPOSE 10000
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8000/ready || exit 1
+    CMD curl -f "http://127.0.0.1:${PORT:-10000}/health" || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port \"${PORT:-10000}\" --workers \"${WEB_CONCURRENCY:-1}\""]

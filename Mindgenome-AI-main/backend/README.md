@@ -75,3 +75,18 @@ To run with coverage:
 ```bash
 pytest --cov=app --cov-report=term-missing
 ```
+
+## Render Deployment
+
+Configure the Render web service to use the Docker runtime with
+`Mindgenome-AI-main/backend` as its repository root directory. The Dockerfile
+binds Uvicorn to Render's `PORT` and serves the liveness check at `/health`.
+Set Render's health check path to `/health`; use `/ready` separately to verify
+database and service dependencies.
+
+In the Render environment, set `DATABASE_URL` to the production PostgreSQL
+connection string using the `postgresql+asyncpg://` scheme. Set
+`CORS_ORIGINS` to a JSON list containing the deployed frontend origin, for
+example `["https://mindgenomeai.vercel.app"]`, and set `FRONTEND_PUBLIC_URL`
+to `https://mindgenomeai.vercel.app`. Keep credentials in Render environment
+variables, not in this repository.

@@ -20,7 +20,12 @@ class Settings(BaseSettings):
     API_PUBLIC_URL: str = "http://localhost:8000"
     FRONTEND_PUBLIC_URL: str = "http://localhost:5173"
     LOG_LEVEL: str = "INFO"
-    CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    CORS_ORIGINS: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "https://mindgenomeai.vercel.app",
+        ]
+    )
 
     # Authentication & JWT
     JWT_ACCESS_TTL_SECONDS: int = 900  # 15 minutes
