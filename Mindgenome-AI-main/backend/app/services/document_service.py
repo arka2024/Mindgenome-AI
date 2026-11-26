@@ -4,11 +4,9 @@ import io
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.storage import storage_adapter
-from app.core.exceptions import ConflictException, NotFoundException
+from app.core.exceptions import NotFoundException
 from app.core.logging import logger
-from app.adapters.redis import rate_limiter
 from app.core.upload_validation import validate_and_inspect_upload
-from app.models.enums import DocumentStatus, IngestionStatus
 from app.models.user import User
 from app.repositories.document_repo import DocumentRepository
 from app.schemas.document import (
@@ -18,7 +16,7 @@ from app.schemas.document import (
     IngestionJobResponse,
     UploadAcceptedResponse,
 )
-from app.workers.tasks.ingestion import _async_process_document, process_document_ingestion
+from app.workers.tasks.ingestion import _async_process_document, dispatch_document_ingestion
 
 
 class DocumentService:
@@ -83,16 +81,7 @@ class DocumentService:
 
         # 6. Dispatch background task
         if background:
-            redis_client = await rate_limiter.get_client()
-            if redis_client is None:
-                import asyncio
-                asyncio.create_task(_async_process_document(str(job.id)))
-            else:
-                try:
-                    process_document_ingestion.delay(str(job.id))
-                except Exception:
-                    import asyncio
-                    asyncio.create_task(_async_process_document(str(job.id)))
+            await dispatch_document_ingestion(str(job.id))
         else:
             await _async_process_document(str(job.id))
 
@@ -203,16 +192,7 @@ class DocumentService:
             idempotency_key=idempotency_key,
         )
 
-        redis_client = await rate_limiter.get_client()
-        if redis_client is None:
-            import asyncio
-            asyncio.create_task(_async_process_document(str(job.id)))
-        else:
-            try:
-                process_document_ingestion.delay(str(job.id))
-            except Exception:
-                import asyncio
-                asyncio.create_task(_async_process_document(str(job.id)))
+        await dispatch_document_ingestion(str(job.id))
 
         return UploadAcceptedResponse(
             document_id=doc.id,

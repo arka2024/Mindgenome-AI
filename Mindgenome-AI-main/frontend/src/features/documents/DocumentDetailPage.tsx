@@ -1,7 +1,7 @@
 import { Link, useParams, useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiFetch } from "@/api/client";
-import type { DocumentRecord } from "@/api/types-extra";
+import type { DocumentRecord, UploadAccepted } from "@/api/types-extra";
 import type { IngestionJob, LearningSession } from "@/api/schemas";
 import { qk } from "@/shared/lib/queryKeys";
 import { Card } from "@/shared/ui/Card";
@@ -26,7 +26,7 @@ import {
 } from "lucide-react";
 
 const STAGE_DESCRIPTIONS: Record<string, string> = {
-  queued: "Document is registered and queued for worker execution.",
+  queued: "Document is registered and waiting for an ingestion processor.",
   parsing: "Extracting structured text, section boundaries, and mathematical notation.",
   chunking: "Partitioning document text into context-rich semantic chunks.",
   embedding: "Generating dense vector embeddings with MiniLM-384 for RAG retrieval.",
@@ -70,6 +70,26 @@ export function DocumentDetailPage() {
     onSuccess: (session) => {
       void queryClient.invalidateQueries({ queryKey: qk.dashboard });
       navigate(`/app/learn/${session.id}`);
+    },
+  });
+
+  const reprocessDocument = useMutation({
+    mutationFn: () =>
+      apiFetch<UploadAccepted>(`/documents/${id}/reprocess`, {
+        method: "POST",
+      }),
+    onSuccess: async () => {
+      pushToast("Ingestion restarted", "The document has been queued for processing.");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: qk.document(id ?? "") }),
+        queryClient.invalidateQueries({ queryKey: qk.documents }),
+      ]);
+    },
+    onError: (error) => {
+      pushToast(
+        "Could not restart ingestion",
+        error instanceof Error ? error.message : "Please try again.",
+      );
     },
   });
 
@@ -222,19 +242,26 @@ export function DocumentDetailPage() {
           </div>
         )}
 
-        {/* Failed Banner */}
-        {isFailed && (
+        {/* Failed or stalled job recovery */}
+        {(isFailed || currentStatus === "queued") && (
           <div className="flex items-center justify-between rounded-control border border-danger/40 bg-danger/10 p-4 text-xs text-danger">
-            <span>Pipeline stalled during concept extraction.</span>
+            <span>
+              {isFailed
+                ? "The ingestion pipeline failed."
+                : "If this job remains queued, restart it to send it to the active processor."}
+            </span>
             <Button
               variant="secondary"
               className="text-xs border-danger/40"
-              onClick={() => {
-                pushToast("Retrying", "Restarting ingestion pipeline worker...");
-                void jobQuery.refetch();
-              }}
+              disabled={reprocessDocument.isPending}
+              onClick={() => reprocessDocument.mutate()}
             >
-              <RefreshCw className="h-3.5 w-3.5 mr-1" /> Retry Ingestion
+              <RefreshCw className="h-3.5 w-3.5 mr-1" />
+              {reprocessDocument.isPending
+                ? "Restarting..."
+                : isFailed
+                  ? "Retry Ingestion"
+                  : "Restart Ingestion"}
             </Button>
           </div>
         )}

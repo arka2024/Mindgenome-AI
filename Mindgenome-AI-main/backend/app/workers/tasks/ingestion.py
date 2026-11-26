@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from sqlalchemy import select
 from app.adapters.gemini import gemini_adapter
 from app.adapters.neo4j import neo4j_adapter
 from app.adapters.qdrant import qdrant_adapter
 from app.adapters.storage import storage_adapter
+from app.core.config import settings
 from app.core.logging import logger
 from app.db.session import AsyncSessionLocal
 from app.models.document import Chapter, Chunk, Document
@@ -18,8 +20,45 @@ from app.services.document_parser import document_parser
 from app.services.embedding_service import embedding_service
 from app.workers.celery_app import celery_app
 
+_background_ingestion_tasks: set[asyncio.Task[None]] = set()
+
+
+async def dispatch_document_ingestion(job_id_str: str) -> None:
+    if settings.CELERY_ENABLED:
+        try:
+            await asyncio.to_thread(process_document_ingestion.delay, job_id_str)
+        except Exception as exc:
+            logger.warning(
+                "celery_ingestion_dispatch_failed_using_api_process",
+                job_id=job_id_str,
+                error=str(exc),
+            )
+        else:
+            logger.info("document_ingestion_dispatched_to_celery", job_id=job_id_str)
+            return
+
+    task = asyncio.create_task(_async_process_document(job_id_str))
+    _background_ingestion_tasks.add(task)
+
+    def finish_ingestion(completed_task: asyncio.Task[None]) -> None:
+        _background_ingestion_tasks.discard(completed_task)
+        if completed_task.cancelled():
+            logger.warning("document_ingestion_background_task_cancelled", job_id=job_id_str)
+            return
+        error = completed_task.exception()
+        if error is not None:
+            logger.error(
+                "document_ingestion_background_task_failed",
+                job_id=job_id_str,
+                error=str(error),
+            )
+
+    task.add_done_callback(finish_ingestion)
+    logger.info("document_ingestion_dispatched_to_api_process", job_id=job_id_str)
+
 
 async def _async_process_document(job_id_str: str) -> None:
+    ingestion_started_at = time.perf_counter()
     job_id = uuid.UUID(job_id_str)
     async with AsyncSessionLocal() as session:
         repo = DocumentRepository(session)
@@ -48,26 +87,43 @@ async def _async_process_document(job_id_str: str) -> None:
             session.add(doc)
             await session.commit()
 
-            file_bytes = storage_adapter.download_file(doc.storage_key)
+            stage_started_at = time.perf_counter()
+            file_bytes = await asyncio.to_thread(storage_adapter.download_file, doc.storage_key)
 
             lower_filename = doc.filename.lower()
             if lower_filename.endswith(".pdf"):
-                parse_result = document_parser.parse_pdf(file_bytes)
+                parse_result = await asyncio.to_thread(document_parser.parse_pdf, file_bytes)
                 if parse_result.is_low_text:
                     ocr_text = await gemini_adapter.ocr_pdf_bytes(file_bytes)
                     if ocr_text:
-                        parse_result = document_parser.parse_text(ocr_text.encode("utf-8"))
+                        parse_result = await asyncio.to_thread(
+                            document_parser.parse_text,
+                            ocr_text.encode("utf-8"),
+                        )
                         logger.info("gemini_pdf_ocr_completed", doc_id=str(doc.id), chars=len(ocr_text))
             elif lower_filename.endswith(".docx"):
-                parse_result = document_parser.parse_docx(file_bytes)
+                parse_result = await asyncio.to_thread(document_parser.parse_docx, file_bytes)
             elif lower_filename.endswith((".jpg", ".jpeg", ".png")):
                 ocr_text = await gemini_adapter.ocr_image_bytes(file_bytes)
                 if not ocr_text:
                     raise ValueError("Gemini OCR returned no readable text")
-                parse_result = document_parser.parse_text(ocr_text.encode("utf-8"))
+                parse_result = await asyncio.to_thread(
+                    document_parser.parse_text,
+                    ocr_text.encode("utf-8"),
+                )
                 logger.info("gemini_image_ocr_completed", doc_id=str(doc.id), chars=len(ocr_text))
             else:
-                parse_result = document_parser.parse_text(file_bytes)
+                parse_result = await asyncio.to_thread(document_parser.parse_text, file_bytes)
+
+            logger.info(
+                "document_ingestion_stage_completed",
+                doc_id=str(doc.id),
+                stage="parsing",
+                duration_ms=round((time.perf_counter() - stage_started_at) * 1000),
+                bytes=len(file_bytes),
+                pages=parse_result.page_count,
+                chunks=len(parse_result.chunks),
+            )
 
             doc.page_count = parse_result.page_count
             doc.is_low_text = parse_result.is_low_text
@@ -87,6 +143,7 @@ async def _async_process_document(job_id_str: str) -> None:
                 return
 
             # Stage 2: CHUNKING (35%)
+            stage_started_at = time.perf_counter()
             await repo.update_job_status(job, IngestionStatus.CHUNKING, progress_pct=35, stage_detail="chunking")
 
             db_chapters = [
@@ -119,11 +176,26 @@ async def _async_process_document(job_id_str: str) -> None:
             ]
             await repo.create_chunks(db_chunks)
             await session.commit()
+            logger.info(
+                "document_ingestion_stage_completed",
+                doc_id=str(doc.id),
+                stage="chunking",
+                duration_ms=round((time.perf_counter() - stage_started_at) * 1000),
+                chunks=len(db_chunks),
+            )
 
             # Stage 3: EMBEDDING (55%)
             await repo.update_job_status(job, IngestionStatus.EMBEDDING, progress_pct=55, stage_detail="embedding")
             chunk_texts = [ck.body for ck in db_chunks]
-            chunk_embeddings = embedding_service.embed_batch(chunk_texts)
+            stage_started_at = time.perf_counter()
+            chunk_embeddings = await asyncio.to_thread(embedding_service.embed_batch, chunk_texts)
+            logger.info(
+                "document_ingestion_stage_completed",
+                doc_id=str(doc.id),
+                stage="embedding",
+                duration_ms=round((time.perf_counter() - stage_started_at) * 1000),
+                chunks=len(chunk_embeddings),
+            )
 
             # Upsert into Qdrant
             qdrant_points = [
@@ -142,8 +214,16 @@ async def _async_process_document(job_id_str: str) -> None:
                 }
                 for ck, emb in zip(db_chunks, chunk_embeddings)
             ]
+            stage_started_at = time.perf_counter()
             await qdrant_adapter.upsert_points(qdrant_points)
             await session.commit()
+            logger.info(
+                "document_ingestion_stage_completed",
+                doc_id=str(doc.id),
+                stage="vector_storage",
+                duration_ms=round((time.perf_counter() - stage_started_at) * 1000),
+                points=len(qdrant_points),
+            )
 
             # Stage 4: EXTRACTING Concepts & Prerequisites via Gemini (75%)
             await repo.update_job_status(job, IngestionStatus.EXTRACTING, progress_pct=75, stage_detail="extracting")
@@ -155,11 +235,19 @@ async def _async_process_document(job_id_str: str) -> None:
             )
             user_prompt = f"Document: {doc.filename}\n\nDATA:\n{combined_summary_text}"
 
+            stage_started_at = time.perf_counter()
             extraction_json, audit = await gemini_adapter.generate_structured_content(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 purpose=LLMPurpose.CONCEPT_EXTRACT,
                 user_id=str(doc.user_id),
+            )
+            logger.info(
+                "document_ingestion_stage_completed",
+                doc_id=str(doc.id),
+                stage="concept_extraction",
+                duration_ms=round((time.perf_counter() - stage_started_at) * 1000),
+                concepts=len(extraction_json.get("concepts", [])),
             )
 
             # Audit LLM call
@@ -178,6 +266,7 @@ async def _async_process_document(job_id_str: str) -> None:
             session.add(call_log)
 
             # Stage 5: GRAPH_BUILT - Neo4j & PostgreSQL Concept sync (90%)
+            stage_started_at = time.perf_counter()
             await repo.update_job_status(job, IngestionStatus.GRAPH_BUILT, progress_pct=90, stage_detail="graph_built")
             raw_concepts = extraction_json.get("concepts", [])
             concept_name_to_id: dict[str, uuid.UUID] = {}
@@ -237,6 +326,13 @@ async def _async_process_document(job_id_str: str) -> None:
                         )
 
             await session.commit()
+            logger.info(
+                "document_ingestion_stage_completed",
+                doc_id=str(doc.id),
+                stage="graph_build",
+                duration_ms=round((time.perf_counter() - stage_started_at) * 1000),
+                concepts=len(raw_concepts),
+            )
 
             # Stage 6: READY (100%)
             await repo.update_job_status(job, IngestionStatus.READY, progress_pct=100, stage_detail="ready")
@@ -244,7 +340,13 @@ async def _async_process_document(job_id_str: str) -> None:
             session.add(doc)
             await session.commit()
 
-            logger.info("document_ingestion_complete", doc_id=str(doc.id), chunks=len(db_chunks), concepts=len(raw_concepts))
+            logger.info(
+                "document_ingestion_complete",
+                doc_id=str(doc.id),
+                chunks=len(db_chunks),
+                concepts=len(raw_concepts),
+                duration_ms=round((time.perf_counter() - ingestion_started_at) * 1000),
+            )
 
         except Exception as exc:
             logger.exception("ingestion_job_failed", job_id=job_id_str, error=str(exc))

@@ -92,3 +92,13 @@ connection string using the `postgresql+asyncpg://` scheme. Set
 example `["https://mindgenomeai.vercel.app"]`, and set `FRONTEND_PUBLIC_URL`
 to `https://mindgenomeai.vercel.app`. Keep credentials in Render environment
 variables, not in this repository.
+
+Ingestion logs include elapsed time for parsing, embedding, vector storage,
+concept extraction, and graph building. Scanned PDFs OCR up to three pages
+concurrently; check these stage timings in Render logs when investigating a
+slow document.
+
+Document jobs run in the API process by default so they do not get stuck in
+Redis without a Celery worker. Set `CELERY_ENABLED=true` only when a Celery
+worker consuming the configured broker is deployed and running. The Docker
+Compose backend enables Celery because its worker service is included.

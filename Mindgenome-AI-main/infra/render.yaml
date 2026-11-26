@@ -14,7 +14,7 @@ services:
     rootDir: Mindgenome-AI-main/frontend
     envVars:
       - key: VITE_API_BASE_URL
-        value: /api/v1
+        value: https://mindgenome-ai-4.onrender.com/api/v1
       - key: VITE_USE_MOCKS
         value: "false"
     routes:

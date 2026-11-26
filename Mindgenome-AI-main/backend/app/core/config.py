@@ -57,6 +57,7 @@ class Settings(BaseSettings):
 
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
+    CELERY_ENABLED: bool = False
 
     # MongoDB Atlas activity/history store
     MONGODB_URI: str = ""

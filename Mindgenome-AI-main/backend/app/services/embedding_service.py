@@ -2,23 +2,28 @@ from __future__ import annotations
 
 import hashlib
 import math
+import threading
 import numpy as np
 from app.core.config import settings
 from app.core.logging import logger
 
 _model = None
+_model_lock = threading.Lock()
+_encode_lock = threading.Lock()
 
 
 def _get_sentence_transformer():
     global _model
     if _model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            _model = SentenceTransformer(settings.EMBEDDING_MODEL)
-            logger.info("sentence_transformer_loaded", model=settings.EMBEDDING_MODEL)
-        except Exception as exc:
-            logger.warning("sentence_transformers_not_available_using_fallback", error=str(exc))
-            _model = False
+        with _model_lock:
+            if _model is None:
+                try:
+                    from sentence_transformers import SentenceTransformer
+                    _model = SentenceTransformer(settings.EMBEDDING_MODEL)
+                    logger.info("sentence_transformer_loaded", model=settings.EMBEDDING_MODEL)
+                except Exception as exc:
+                    logger.warning("sentence_transformers_not_available_using_fallback", error=str(exc))
+                    _model = False
     return _model if _model is not False else None
 
 
@@ -38,7 +43,8 @@ class EmbeddingService:
         model = _get_sentence_transformer()
         if model is not None:
             try:
-                embeddings = model.encode(texts, normalize_embeddings=True)
+                with _encode_lock:
+                    embeddings = model.encode(texts, normalize_embeddings=True)
                 return [emb.tolist() for emb in embeddings]
             except Exception as exc:
                 logger.error("model_encode_failed_using_deterministic_fallback", error=str(exc))

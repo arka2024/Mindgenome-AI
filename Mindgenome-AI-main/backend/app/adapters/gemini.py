@@ -13,6 +13,7 @@ from app.core.logging import logger
 from app.models.enums import LLMCallStatus, LLMPurpose
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+OCR_PDF_MAX_CONCURRENCY = 3
 
 
 STOP_WORDS = {
@@ -177,15 +178,30 @@ class GeminiAdapter:
         except Exception as exc:
             raise RuntimeError("PyMuPDF is not available for PDF OCR") from exc
 
-        extracted: list[str] = []
         document = fitz.open(stream=content, filetype="pdf")
+        page_semaphore = asyncio.Semaphore(OCR_PDF_MAX_CONCURRENCY)
+        render_lock = asyncio.Lock()
         try:
-            for page_index in range(min(document.page_count, max_pages)):
-                page = document.load_page(page_index)
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-                text = await self.ocr_image_bytes(pixmap.tobytes("png"))
+            async def extract_page(page_index: int) -> str:
+                async with page_semaphore:
+                    async with render_lock:
+                        page = document.load_page(page_index)
+                        pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                        image_bytes = pixmap.tobytes("png")
+                    text = await self.ocr_image_bytes(image_bytes)
+                    return f"[Page {page_index + 1}]\n{text}" if text else ""
+
+            async with asyncio.TaskGroup() as task_group:
+                tasks = [
+                    task_group.create_task(extract_page(page_index))
+                    for page_index in range(min(document.page_count, max_pages))
+                ]
+
+            extracted = []
+            for task in tasks:
+                text = task.result()
                 if text:
-                    extracted.append(f"[Page {page_index + 1}]\n{text}")
+                    extracted.append(text)
         finally:
             document.close()
 

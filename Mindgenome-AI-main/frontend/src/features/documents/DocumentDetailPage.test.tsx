@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { DocumentDetailPage } from "./DocumentDetailPage";
@@ -75,5 +75,33 @@ describe("DocumentDetailPage", () => {
     expect(
       screen.getByText(/Corpus Ready for Learning & RAG Tutoring/i),
     ).toBeInTheDocument();
+  });
+
+  it("restarts a queued ingestion job through the reprocess endpoint", async () => {
+    const queuedDoc = { ...mockDoc, status: "uploaded" as const };
+    const queuedJob = { ...mockJob, status: "queued" as const, progress_pct: 5 };
+    const mockApiFetch = vi.mocked(client.apiFetch);
+    mockApiFetch.mockImplementation(async (path) => {
+      if (path === "/documents/doc-1") return queuedDoc;
+      if (path === "/ingestion-jobs/job-1") return queuedJob;
+      if (path === "/documents/doc-1/reprocess") {
+        return { document_id: "doc-1", job_id: "job-2", status: "queued" };
+      }
+      if (path === "/ingestion-jobs/job-2") {
+        return { ...queuedJob, id: "job-2", status: "parsing" };
+      }
+      return {};
+    });
+
+    renderWithRoute(<DocumentDetailPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /restart ingestion/i }));
+
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        "/documents/doc-1/reprocess",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
   });
 });
