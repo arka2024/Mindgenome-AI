@@ -78,11 +78,13 @@ pytest --cov=app --cov-report=term-missing
 
 ## Render Deployment
 
-Configure the Render web service to use the Docker runtime with
-`Mindgenome-AI-main/backend` as its repository root directory. The Dockerfile
-binds Uvicorn to Render's `PORT` and serves the liveness check at `/health`.
-Set Render's health check path to `/health`; use `/ready` separately to verify
-database and service dependencies.
+Configure the Render web service to use Python 3.12 and
+`Mindgenome-AI-main/backend` as its repository root directory. The
+`.python-version` file pins Python 3.12.10 so Render does not select a newer
+Python release without a compatible CPU PyTorch wheel. If deploying with
+Docker, the Dockerfile binds Uvicorn to Render's `PORT` and serves the
+liveness check at `/health`. Set Render's health check path to `/health`; use
+`/ready` separately to verify database and service dependencies.
 
 In the Render environment, set `DATABASE_URL` to the production PostgreSQL
 connection string using the `postgresql+asyncpg://` scheme. Set
