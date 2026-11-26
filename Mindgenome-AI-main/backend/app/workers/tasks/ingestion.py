@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from app.adapters.gemini import gemini_adapter
 from app.adapters.neo4j import neo4j_adapter
 from app.adapters.qdrant import qdrant_adapter
@@ -145,6 +145,12 @@ async def _async_process_document(job_id_str: str) -> None:
             # Stage 2: CHUNKING (35%)
             stage_started_at = time.perf_counter()
             await repo.update_job_status(job, IngestionStatus.CHUNKING, progress_pct=35, stage_detail="chunking")
+            await session.commit()
+
+            # A reprocess must replace prior document-scoped rows before ordinal values restart.
+            await qdrant_adapter.delete_by_document(str(doc.user_id), str(doc.id))
+            await session.execute(delete(Chunk).where(Chunk.document_id == doc.id))
+            await session.execute(delete(Chapter).where(Chapter.document_id == doc.id))
 
             db_chapters = [
                 Chapter(
@@ -186,6 +192,7 @@ async def _async_process_document(job_id_str: str) -> None:
 
             # Stage 3: EMBEDDING (55%)
             await repo.update_job_status(job, IngestionStatus.EMBEDDING, progress_pct=55, stage_detail="embedding")
+            await session.commit()
             chunk_texts = [ck.body for ck in db_chunks]
             stage_started_at = time.perf_counter()
             chunk_embeddings = await asyncio.to_thread(embedding_service.embed_batch, chunk_texts)
@@ -227,6 +234,7 @@ async def _async_process_document(job_id_str: str) -> None:
 
             # Stage 4: EXTRACTING Concepts & Prerequisites via Gemini (75%)
             await repo.update_job_status(job, IngestionStatus.EXTRACTING, progress_pct=75, stage_detail="extracting")
+            await session.commit()
             combined_summary_text = "\n\n".join(chunk_texts[:4])
             system_prompt = (
                 "You are the MindGenome AI Concept Extraction engine. Extract key academic concepts, "
@@ -268,42 +276,59 @@ async def _async_process_document(job_id_str: str) -> None:
             # Stage 5: GRAPH_BUILT - Neo4j & PostgreSQL Concept sync (90%)
             stage_started_at = time.perf_counter()
             await repo.update_job_status(job, IngestionStatus.GRAPH_BUILT, progress_pct=90, stage_detail="graph_built")
+            await session.commit()
             raw_concepts = extraction_json.get("concepts", [])
             concept_name_to_id: dict[str, uuid.UUID] = {}
-
+            concepts_by_name: dict[str, dict[str, str]] = {}
             for c in raw_concepts:
                 c_name = c.get("canonical_name", "").strip()
-                norm_name = c.get("normalized_name", c_name.lower()).strip()
+                norm_name = c.get("normalized_name", c_name.lower()).strip().lower()
                 lemma = c.get("lemma", norm_name).strip()
                 definition = c.get("definition", "").strip()
 
                 if not c_name:
                     continue
-
-                # Check if concept already exists in Postgres
-                stmt = select(Concept).where(Concept.user_id == doc.user_id, Concept.normalized_name == norm_name)
-                res = await session.execute(stmt)
-                db_concept = res.scalar_one_or_none()
-
-                if not db_concept:
-                    db_concept = Concept(
-                        user_id=doc.user_id,
-                        canonical_name=c_name,
-                        normalized_name=norm_name,
-                        lemma=lemma,
-                        definition=definition,
-                    )
-                    session.add(db_concept)
-                    await session.flush()
-
-                concept_name_to_id[norm_name] = db_concept.id
-                # Neo4j Merge Concept Node
-                await neo4j_adapter.merge_concept(
-                    user_id=str(doc.user_id),
-                    concept_id=str(db_concept.id),
-                    name=c_name,
-                    normalized_name=norm_name,
+                concepts_by_name.setdefault(
+                    norm_name,
+                    {
+                        "canonical_name": c_name,
+                        "lemma": lemma,
+                        "definition": definition,
+                    },
                 )
+
+            normalized_names = list(concepts_by_name)
+            existing_result = await session.execute(
+                select(Concept).where(
+                    Concept.user_id == doc.user_id,
+                    Concept.normalized_name.in_(normalized_names),
+                )
+            )
+            concepts_by_id = {concept.normalized_name: concept for concept in existing_result.scalars()}
+            for norm_name, concept_data in concepts_by_name.items():
+                if norm_name not in concepts_by_id:
+                    concept = Concept(
+                        user_id=doc.user_id,
+                        canonical_name=concept_data["canonical_name"],
+                        normalized_name=norm_name,
+                        lemma=concept_data["lemma"],
+                        definition=concept_data["definition"],
+                    )
+                    session.add(concept)
+                    concepts_by_id[norm_name] = concept
+            await session.flush()
+
+            neo4j_concepts = []
+            for norm_name, concept in concepts_by_id.items():
+                concept_name_to_id[norm_name] = concept.id
+                neo4j_concepts.append(
+                    {
+                        "concept_id": str(concept.id),
+                        "name": concepts_by_name[norm_name]["canonical_name"],
+                        "normalized_name": norm_name,
+                    }
+                )
+            await neo4j_adapter.merge_concepts(str(doc.user_id), neo4j_concepts)
 
             # Write Prerequisite Edges with Cycle Guard
             for c in raw_concepts:

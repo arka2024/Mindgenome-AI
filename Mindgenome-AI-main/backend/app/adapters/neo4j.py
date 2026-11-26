@@ -121,6 +121,32 @@ class Neo4jAdapter:
             "normalized_name": normalized_name,
         }
 
+    async def merge_concepts(self, user_id: str, concepts: list[dict[str, str]]) -> None:
+        if not concepts:
+            return
+
+        driver = await self.get_driver()
+        if driver is not None:
+            cypher = """
+            UNWIND $concepts AS item
+            MERGE (c:Concept {user_id: $user_id, concept_id: item.concept_id})
+            ON CREATE SET c.name = item.name,
+                          c.normalized_name = item.normalized_name,
+                          c.created_at = datetime()
+            ON MATCH SET c.name = item.name
+            """
+            await self.run_query(cypher, {"user_id": user_id, "concepts": concepts})
+            return
+
+        for concept in concepts:
+            key = f"{user_id}:{concept['concept_id']}"
+            self._memory_nodes[key] = {
+                "user_id": user_id,
+                "concept_id": concept["concept_id"],
+                "name": concept["name"],
+                "normalized_name": concept["normalized_name"],
+            }
+
     async def merge_prerequisite_edge(
         self,
         user_id: str,
@@ -136,27 +162,45 @@ class Neo4jAdapter:
         if from_concept_id == to_concept_id:
             return False
 
-        if await self.check_cycle(user_id, from_concept_id, to_concept_id):
-            logger.warning("skipped_prerequisite_cycle", from_id=from_concept_id, to_id=to_concept_id)
-            return False
-
         driver = await self.get_driver()
         if driver is not None:
             cypher = """
             MATCH (a:Concept {user_id: $user_id, concept_id: $from_id})
             MATCH (b:Concept {user_id: $user_id, concept_id: $to_id})
+            CALL {
+                WITH a, b
+                OPTIONAL MATCH path = (b)-[:PREREQUISITE_OF*1..16]->(a)
+                WHERE ALL(n IN nodes(path) WHERE n.user_id = $user_id)
+                  AND ALL(rel IN relationships(path) WHERE rel.user_id = $user_id)
+                RETURN count(path) > 0 AS would_cycle
+            }
+            WITH a, b, would_cycle
+            WHERE NOT would_cycle
             MERGE (a)-[r:PREREQUISITE_OF {user_id: $user_id}]->(b)
             ON CREATE SET r.confidence = $confidence, r.status = $status, r.created_at = datetime()
             ON MATCH SET r.confidence = $confidence, r.status = $status
+            RETURN true AS merged
             """
-            await self.run_query(cypher, {
+            result = await self.run_query(cypher, {
                 "user_id": user_id,
                 "from_id": from_concept_id,
                 "to_id": to_concept_id,
                 "confidence": confidence,
                 "status": status,
             })
-            return True
+            if result and result[0].get("merged"):
+                return True
+
+            logger.warning(
+                "prerequisite_edge_not_merged",
+                from_id=from_concept_id,
+                to_id=to_concept_id,
+            )
+            return False
+
+        if await self.check_cycle(user_id, from_concept_id, to_concept_id):
+            logger.warning("skipped_prerequisite_cycle", from_id=from_concept_id, to_id=to_concept_id)
+            return False
 
         # In-memory edge
         edge_id = str(uuid.uuid4())

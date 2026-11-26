@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,9 +34,10 @@ class DocumentService:
         background: bool = True,
     ) -> UploadAcceptedResponse:
         # 1. Validate file content and magic bytes
-        safe_name, verified_mime, byte_size, sha256 = validate_and_inspect_upload(
-            filename=filename,
-            content=content,
+        safe_name, verified_mime, byte_size, sha256 = await asyncio.to_thread(
+            validate_and_inspect_upload,
+            filename,
+            content,
         )
 
         # 2. Check for duplicate upload by the same user
@@ -57,7 +59,8 @@ class DocumentService:
         )
 
         # 4. Upload to S3/MinIO
-        storage_adapter.upload_file(
+        await asyncio.to_thread(
+            storage_adapter.upload_file,
             file_obj=io.BytesIO(content),
             storage_key=storage_key,
             content_type=verified_mime,
@@ -79,6 +82,9 @@ class DocumentService:
             idempotency_key=idempotency_key,
         )
 
+        # Ensure the worker can see the job before dispatch begins.
+        await self.session.commit()
+
         # 6. Dispatch background task
         if background:
             await dispatch_document_ingestion(str(job.id))
@@ -99,9 +105,13 @@ class DocumentService:
         page_size: int = 20,
     ) -> DocumentListResponse:
         docs, total = await self.repo.list_user_documents(user.id, page=page, page_size=page_size)
+        latest_jobs = await self.repo.get_latest_jobs_for_documents(
+            [document.id for document in docs],
+            user.id,
+        )
         items: list[DocumentResponse] = []
         for d in docs:
-            latest_job = await self.repo.get_latest_job_for_document(d.id, user.id)
+            latest_job = latest_jobs.get(d.id)
             items.append(
                 DocumentResponse(
                     id=d.id,
@@ -192,6 +202,7 @@ class DocumentService:
             idempotency_key=idempotency_key,
         )
 
+        await self.session.commit()
         await dispatch_document_ingestion(str(job.id))
 
         return UploadAcceptedResponse(

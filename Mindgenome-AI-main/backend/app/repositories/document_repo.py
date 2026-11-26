@@ -136,6 +136,28 @@ class DocumentRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_latest_jobs_for_documents(
+        self,
+        document_ids: list[uuid.UUID],
+        user_id: uuid.UUID | None = None,
+    ) -> dict[uuid.UUID, IngestionJob]:
+        if not document_ids:
+            return {}
+
+        stmt = (
+            select(IngestionJob)
+            .where(IngestionJob.document_id.in_(document_ids))
+            .order_by(IngestionJob.created_at.desc())
+        )
+        if user_id:
+            stmt = stmt.where(IngestionJob.user_id == user_id)
+
+        result = await self.session.execute(stmt)
+        latest_jobs: dict[uuid.UUID, IngestionJob] = {}
+        for job in result.scalars():
+            latest_jobs.setdefault(job.document_id, job)
+        return latest_jobs
+
     async def update_job_status(
         self,
         job: IngestionJob,

@@ -5,6 +5,30 @@ from app.adapters.neo4j import Neo4jAdapter
 
 
 @pytest.mark.asyncio
+async def test_merge_concepts_populates_memory_graph():
+    adapter = Neo4jAdapter()
+
+    await adapter.merge_concepts(
+        "test-user-batch",
+        [
+            {
+                "concept_id": "concept-1",
+                "name": "Decision Trees",
+                "normalized_name": "decision trees",
+            },
+            {
+                "concept_id": "concept-2",
+                "name": "Boosting",
+                "normalized_name": "boosting",
+            },
+        ],
+    )
+
+    assert adapter._memory_nodes["test-user-batch:concept-1"]["name"] == "Decision Trees"
+    assert adapter._memory_nodes["test-user-batch:concept-2"]["normalized_name"] == "boosting"
+
+
+@pytest.mark.asyncio
 async def test_neo4j_cycle_detection():
     adapter = Neo4jAdapter()
     user_id = "test-user-cycle-123"

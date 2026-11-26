@@ -54,9 +54,10 @@ export function DocumentDetailPage() {
     enabled: Boolean(docQuery.data?.job_id),
     refetchInterval: (query) => {
       const status = query.state.data?.status;
-      // Continue polling every 1.5 seconds until the job reaches a terminal state
       if (!status || status === "ready" || status === "failed") return false;
-      return 1500;
+      if (status === "queued") return 5000;
+      if (status === "parsing") return 3000;
+      return 2500;
     },
   });
 
