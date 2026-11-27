@@ -15,7 +15,7 @@ flowchart TD
     API -->|Auth / Transactions / RLS| Postgres[("PostgreSQL 16 (Source of Truth)")]
     API -->|Rate Limiting & Cache| Redis[("Redis 7")]
     API -->|Store & Fetch Documents| S3[("S3 / MinIO Object Storage")]
-    API -->|Vector Similarity Search| Qdrant[("Qdrant (384-d Cosine Vectors)")]
+    API -->|Vector Similarity Search| Qdrant[("Qdrant (Gemini 768-d Cosine Vectors)")]
     API -->|Prerequisite Traversal & Cycle Check| Neo4j[("Neo4j 5 (Graph DB)")]
     
     API -->|Enqueue Ingestion Jobs| CeleryBroker["Redis Queue (:6379/1)"]
@@ -33,7 +33,7 @@ flowchart TD
 | :--- | :--- |
 | **PostgreSQL 16** | **Source of Truth (SoT)**. All users, documents, chapters, chunks, concepts, questions, attempts, mastery history, and outbox records. Enforces Row-Level Security (`app.current_user_id`). |
 | **Neo4j 5** | **Knowledge Graph**. Manages `Concept` nodes, `PREREQUISITE_OF` edges (enforcing cycle prevention via DAG algorithms), and `STRUGGLES_WITH` diagnostic edges. |
-| **Qdrant** | **Vector Database**. Stores 384-dimensional dense embeddings (`all-MiniLM-L6-v2`) with cosine distance and hard `user_id` payload filters for tenant isolation. |
+| **Qdrant** | **Vector Database**. Stores versioned, normalized 768-dimensional dense embeddings from Gemini `gemini-embedding-001` with cosine distance and hard `user_id` payload filters for tenant isolation. |
 | **Redis 7** | Cache, sliding-window rate limiting (5 req/min on auth, 100 req/min on API), and Celery task broker. |
 | **MinIO / S3** | Encrypted object storage for uploaded lecture notes, textbooks, and parsed chapter payloads. |
 | **Celery Worker** | Asynchronous multi-stage document ingestion pipeline (`queued` $\rightarrow$ `parsing` $\rightarrow$ `chunking` $\rightarrow$ `embedding` $\rightarrow$ `extracting` $\rightarrow$ `graph_built` $\rightarrow$ `ready`). |

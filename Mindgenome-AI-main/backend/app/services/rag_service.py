@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from typing import Any
@@ -10,6 +11,7 @@ from app.adapters.gemini import gemini_adapter
 from app.adapters.neo4j import neo4j_adapter
 from app.adapters.qdrant import qdrant_adapter
 from app.adapters.mongo import mongo_activity_store
+from app.core.config import settings
 from app.core.logging import logger
 from app.models.document import Chunk, Document
 from app.models.enums import LLMPurpose
@@ -32,14 +34,14 @@ class RAGService:
         Graph-augmented dense retrieval RAG pipeline.
         """
         # 1. Embed query
-        query_vec = embedding_service.embed_text(question)
+        query_vec = await asyncio.to_thread(embedding_service.embed_query, question)
 
         # 2. Retrieve top-12 chunk vectors from Qdrant
         hits = await qdrant_adapter.search_points(
             user_id=str(user.id),
             query_vector=query_vec,
-            top_k=12,
-            min_score=0.35,
+            top_k=settings.RAG_TOP_K,
+            min_score=settings.RAG_MIN_SIMILARITY_SCORE,
             document_id=str(document_id) if document_id else None,
         )
 

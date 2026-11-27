@@ -73,7 +73,13 @@ class Settings(BaseSettings):
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_API_KEY: str = ""
     QDRANT_COLLECTION: str = "mindgenome_chunks"
-    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
+    EMBEDDING_COLLECTION_NAME: str = ""
+    EMBEDDING_MODEL: str = "gemini-embedding-001"
+    EMBEDDING_VERSION: str = "gemini_embedding_001_v1"
+    EMBEDDING_DIMENSION: int = 768
+    EMBEDDING_BATCH_SIZE: int = 32
+    RAG_TOP_K: int = 12
+    RAG_MIN_SIMILARITY_SCORE: float = 0.35
     RATE_LIMIT_AUTH_PER_MINUTE: int = 5
     RATE_LIMIT_DEFAULT_PER_MINUTE: int = 120
 

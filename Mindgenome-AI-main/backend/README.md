@@ -102,3 +102,106 @@ Document jobs run in the API process by default so they do not get stuck in
 Redis without a Celery worker. Set `CELERY_ENABLED=true` only when a Celery
 worker consuming the configured broker is deployed and running. The Docker
 Compose backend enables Celery because its worker service is included.
+
+## Embedding model and safe migration
+
+Document chunk vectors are stored in **Qdrant**. MongoDB is not the vector
+database. Ingestion embeds chunks, while `/api/v1/tutor/ask` embeds learner
+questions and retrieves matching chunks. The configured provider is Google
+Gemini's `gemini-embedding-001`, with normalized 768-dimensional vectors.
+Query and document requests use the API's `RETRIEVAL_QUERY` and
+`RETRIEVAL_DOCUMENT` task types, respectively. Texts are sent in bounded batches
+using the existing `GEMINI_API_KEY`; no local embedding model or separate
+inference service is required. API failures, including quota exhaustion, stop
+the operation rather than silently switching models.
+
+Google AI Studio's free-tier availability and quotas can change and are subject
+to Google's terms. Uploaded document text and learner queries are sent to
+Google's API for embedding; review Google's current data-use terms and your
+privacy requirements before enabling this in production. Do not send sensitive
+or regulated documents unless the configured service terms permit that use.
+
+Every model/version uses a separate Qdrant collection by default:
+`<QDRANT_COLLECTION>_<EMBEDDING_VERSION>`. Existing MiniLM and Qwen collections
+are left untouched. Search filters by model, version and dimension, and chunks
+record embedding provenance in PostgreSQL. Reprocessing preserves chunk IDs;
+stale points in the active collection are removed only after new embeddings
+pass dimension/normalization checks and have been upserted successfully.
+
+### Production rollout
+
+1. Back up PostgreSQL and Qdrant. Do not delete the existing MiniLM collection
+   during this rollout.
+2. Deploy the application dependencies and run the database migration:
+
+   ```bash
+   cd backend
+   alembic upgrade head
+   ```
+
+3. Configure the Render backend and **every Celery worker** with the same
+   embedding settings. Keep `GEMINI_API_KEY` secret in Render:
+
+   ```env
+   EMBEDDING_MODEL=gemini-embedding-001
+   EMBEDDING_VERSION=gemini_embedding_001_v1
+   EMBEDDING_DIMENSION=768
+   EMBEDDING_BATCH_SIZE=32
+   QDRANT_COLLECTION=mindgenome_chunks
+   EMBEDDING_COLLECTION_NAME=
+   GEMINI_API_KEY=<your Google AI Studio API key>
+   ```
+
+   Leave `EMBEDDING_COLLECTION_NAME` empty to create/use the versioned Gemini
+   collection. Do not enable `CELERY_ENABLED` until a worker is deployed.
+4. Deploy the API, verify `/ready`, and ensure the new Qdrant collection is
+   created at the configured dimension. Test a new document and tutor question
+   before re-indexing existing content. Run
+   `python -m scripts.smoke_test_embeddings` from the backend service root to
+   check the Gemini API call, Qdrant insertion, metadata filtering and
+   retrieval.
+5. Start with a dry run, then re-index gradually:
+
+   ```bash
+   cd backend
+   python -m scripts.reindex_embeddings --dry-run
+   python -m scripts.reindex_embeddings --limit 5
+   python -m scripts.reindex_embeddings
+   ```
+
+   The command uses the running Celery worker when `CELERY_ENABLED=true`;
+   otherwise it processes documents sequentially in the command process. It
+   selects documents whose chunk provenance does not match the configured
+   model/version/dimension. Monitor failed jobs and Qdrant points before
+   continuing. Old MiniLM and Qwen vectors remain in their original
+   collections.
+6. To roll back, redeploy the previous application version that supports
+   MiniLM and point it to the **actual existing MiniLM collection name**. The
+   current embedding service intentionally accepts only Gemini embeddings; do
+   not change model settings to MiniLM in this version. Do not delete either
+   collection until the rollback is validated.
+
+### Retrieval evaluation
+
+No representative lecture-document benchmark dataset was available, so no
+MiniLM-vs-Gemini quality or latency comparison is claimed. To measure it,
+prepare a UTF-8 JSONL dataset with one record per question, the candidate
+passages, and the indices of the relevant passages:
+
+```json
+{"query":"How does gradient descent update model parameters?","candidates":["Passage A","Passage B"],"relevant_indices":[1]}
+```
+
+On a development/evaluation machine, install the evaluation dependencies with
+`pip install -e ".[dev]"`, then run:
+
+```bash
+python -m scripts.benchmark_embeddings --dataset path\to\lecture_queries.jsonl --top-k 5
+```
+
+The script reports Recall@K, MRR and elapsed time for both models on the same
+examples. Gemini calls count against the configured API quota. Use held-out
+questions and passages from your own lecture materials; adjust
+`RAG_MIN_SIMILARITY_SCORE` only after reviewing retrieval results and grounded
+answer quality. Re-indexed documents retain their source text, document/chunk
+IDs, page range and chapter/section metadata in Qdrant payloads.

@@ -1,71 +1,162 @@
 from __future__ import annotations
 
-import hashlib
-import math
 import threading
+from typing import Any, Literal
+
 import numpy as np
+
 from app.core.config import settings
 from app.core.logging import logger
 
-_model = None
-_model_lock = threading.Lock()
-_encode_lock = threading.Lock()
-
-
-def _get_sentence_transformer():
-    global _model
-    if _model is None:
-        with _model_lock:
-            if _model is None:
-                try:
-                    from sentence_transformers import SentenceTransformer
-                    _model = SentenceTransformer(settings.EMBEDDING_MODEL)
-                    logger.info("sentence_transformer_loaded", model=settings.EMBEDDING_MODEL)
-                except Exception as exc:
-                    logger.warning("sentence_transformers_not_available_using_fallback", error=str(exc))
-                    _model = False
-    return _model if _model is not False else None
+EmbeddingInputType = Literal["query", "document"]
 
 
 class EmbeddingService:
-    def __init__(self, dim: int = 384) -> None:
-        self.dim = dim
+    def __init__(
+        self,
+        model_name: str | None = None,
+        version: str | None = None,
+        dimension: int | None = None,
+    ) -> None:
+        self.model_name = model_name or settings.EMBEDDING_MODEL
+        self.version = version or settings.EMBEDDING_VERSION
+        self.dimension = dimension if dimension is not None else settings.EMBEDDING_DIMENSION
+        self.batch_size = settings.EMBEDDING_BATCH_SIZE
+        self._client: Any = None
+        self._client_lock = threading.Lock()
+
+        if self.model_name != "gemini-embedding-001":
+            raise ValueError(
+                "Only gemini-embedding-001 is supported by this embedding service"
+            )
+        if self.dimension < 1:
+            raise ValueError("EMBEDDING_DIMENSION must be at least 1")
+        if not self.version.strip():
+            raise ValueError("EMBEDDING_VERSION must not be empty")
+        if self.batch_size < 1:
+            raise ValueError("EMBEDDING_BATCH_SIZE must be at least 1")
 
     def embed_text(self, text: str) -> list[float]:
-        """Embed a single text string into a normalized vector of size self.dim."""
-        return self.embed_batch([text])[0]
+        """Backward-compatible query embedding entry point."""
+        return self.embed_query(text)
 
-    def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Embed a list of text strings."""
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_batch([text], input_type="query")[0]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.embed_batch(texts, input_type="document")
+
+    def embed_batch(
+        self,
+        texts: list[str],
+        input_type: EmbeddingInputType = "document",
+    ) -> list[list[float]]:
         if not texts:
             return []
+        if input_type not in ("query", "document"):
+            raise ValueError(f"Unsupported embedding input type: {input_type}")
 
-        model = _get_sentence_transformer()
-        if model is not None:
+        embeddings = self._embed_gemini(texts, input_type)
+        return self._validate_embeddings(embeddings, len(texts))
+
+    def _get_client(self) -> tuple[Any, Any]:
+        if not settings.GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY is not configured for embeddings")
+
+        with self._client_lock:
+            if self._client is None:
+                try:
+                    from google import genai
+                    from google.genai import types
+                except ImportError as exc:
+                    logger.exception("gemini_embedding_sdk_missing")
+                    raise RuntimeError(
+                        "Gemini embeddings require the google-genai package"
+                    ) from exc
+
+                self._client = genai.Client(
+                    api_key=settings.GEMINI_API_KEY,
+                    http_options=types.HttpOptions(
+                        timeout=settings.GEMINI_TIMEOUT_SECONDS * 1000
+                    ),
+                )
+                self._types = types
+
+            return self._client, self._types
+
+    def _embed_gemini(
+        self,
+        texts: list[str],
+        input_type: EmbeddingInputType,
+    ) -> list[list[float]]:
+        client, types = self._get_client()
+        task_type = "RETRIEVAL_QUERY" if input_type == "query" else "RETRIEVAL_DOCUMENT"
+        embeddings: list[list[float]] = []
+
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start : start + self.batch_size]
             try:
-                with _encode_lock:
-                    embeddings = model.encode(texts, normalize_embeddings=True)
-                return [emb.tolist() for emb in embeddings]
+                response = client.models.embed_content(
+                    model=self.model_name,
+                    contents=batch,
+                    config=types.EmbedContentConfig(
+                        task_type=task_type,
+                        output_dimensionality=self.dimension,
+                    ),
+                )
             except Exception as exc:
-                logger.error("model_encode_failed_using_deterministic_fallback", error=str(exc))
+                logger.exception(
+                    "gemini_embedding_request_failed",
+                    model=self.model_name,
+                    version=self.version,
+                    input_type=input_type,
+                    batch_size=len(batch),
+                    error=str(exc),
+                )
+                raise RuntimeError("Gemini embedding API request failed") from exc
 
-        # Deterministic fallback vector generation based on sha256 + token distribution
-        vectors: list[list[float]] = []
-        for text in texts:
-            vec = np.zeros(self.dim, dtype=np.float32)
-            words = text.lower().split()
-            if not words:
-                words = ["empty"]
-            for i, word in enumerate(words):
-                h = int(hashlib.sha256(word.encode("utf-8")).hexdigest(), 16)
-                idx = (h + i) % self.dim
-                weight = 1.0 / math.sqrt(i + 1)
-                vec[idx] += weight
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-            vectors.append(vec.tolist())
-        return vectors
+            batch_embeddings = getattr(response, "embeddings", None)
+            if not batch_embeddings:
+                raise RuntimeError("Gemini embedding API returned no embeddings")
+            for embedding in batch_embeddings:
+                values = getattr(embedding, "values", None)
+                if values is None:
+                    raise RuntimeError("Gemini embedding API returned an embedding without values")
+                embeddings.append(list(values))
+
+        return embeddings
+
+    def _validate_embeddings(
+        self,
+        embeddings: list[list[float]],
+        expected_count: int,
+    ) -> list[list[float]]:
+        if len(embeddings) != expected_count:
+            raise RuntimeError(
+                f"Embedding model returned {len(embeddings)} vectors for {expected_count} inputs"
+            )
+
+        validated: list[list[float]] = []
+        for vector in embeddings:
+            if len(vector) != self.dimension:
+                raise RuntimeError(
+                    f"Embedding model returned dimension {len(vector)}; expected {self.dimension}"
+                )
+            values = np.asarray(vector, dtype=np.float32)
+            if not np.isfinite(values).all():
+                raise RuntimeError("Embedding model returned a non-finite vector value")
+            norm = float(np.linalg.norm(values))
+            if norm == 0:
+                raise RuntimeError("Embedding model returned a zero vector")
+            normalized = values / norm
+            validated.append(normalized.tolist())
+        return validated
+
+    def close(self) -> None:
+        with self._client_lock:
+            if self._client is not None:
+                self._client.close()
+                self._client = None
 
 
-embedding_service = EmbeddingService(dim=384)
+embedding_service = EmbeddingService()

@@ -128,6 +128,9 @@ class Chunk(Base, UUIDMixin, TimestampMixin, SoftDeleteMixin):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     qdrant_point_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    embedding_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    embedding_dimension: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     document: Mapped[Document] = relationship("Document", back_populates="chunks")
     chapter: Mapped[Chapter | None] = relationship("Chapter", back_populates="chunks")

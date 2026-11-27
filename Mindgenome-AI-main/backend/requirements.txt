@@ -1,9 +1,5 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.31.0
-# Keep Linux deployments on CPU-only PyTorch wheels to avoid downloading CUDA libraries.
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.7.0+cpu; sys_platform == "linux"
-torch>=2.7.0,<3.0; sys_platform != "linux"
 pydantic>=2.9.0
 pydantic-settings>=2.5.0
 sqlalchemy[asyncio]>=2.0.35
@@ -25,7 +21,6 @@ Pillow>=11.0.0
 PyMuPDF>=1.24.0
 neo4j>=5.25.0
 qdrant-client>=1.12.0
-sentence-transformers>=3.0.0
 motor>=3.6.0
 boto3>=1.35.0
 pypdf>=5.0.0

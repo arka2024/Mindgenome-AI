@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from app.adapters.gemini import gemini_adapter
 from app.adapters.neo4j import neo4j_adapter
 from app.adapters.qdrant import qdrant_adapter
@@ -147,40 +147,78 @@ async def _async_process_document(job_id_str: str) -> None:
             await repo.update_job_status(job, IngestionStatus.CHUNKING, progress_pct=35, stage_detail="chunking")
             await session.commit()
 
-            # A reprocess must replace prior document-scoped rows before ordinal values restart.
-            await qdrant_adapter.delete_by_document(str(doc.user_id), str(doc.id))
-            await session.execute(delete(Chunk).where(Chunk.document_id == doc.id))
-            await session.execute(delete(Chapter).where(Chapter.document_id == doc.id))
+            existing_chapters_result = await session.execute(
+                select(Chapter).where(Chapter.document_id == doc.id).order_by(Chapter.ordinal)
+            )
+            existing_chapters = {
+                chapter.ordinal: chapter for chapter in existing_chapters_result.scalars()
+            }
 
-            db_chapters = [
-                Chapter(
-                    user_id=doc.user_id,
-                    document_id=doc.id,
-                    title=ch.title,
-                    ordinal=ch.ordinal,
-                    start_page=ch.start_page,
-                    end_page=ch.end_page,
-                )
-                for ch in parse_result.chapters
-            ]
-            await repo.create_chapters(db_chapters)
+            db_chapters: list[Chapter] = []
+            new_chapters: list[Chapter] = []
+            for parsed_chapter in parse_result.chapters:
+                chapter = existing_chapters.pop(parsed_chapter.ordinal, None)
+                if chapter is None:
+                    chapter = Chapter(
+                        user_id=doc.user_id,
+                        document_id=doc.id,
+                        title=parsed_chapter.title,
+                        ordinal=parsed_chapter.ordinal,
+                        start_page=parsed_chapter.start_page,
+                        end_page=parsed_chapter.end_page,
+                    )
+                    new_chapters.append(chapter)
+                else:
+                    chapter.title = parsed_chapter.title
+                    chapter.start_page = parsed_chapter.start_page
+                    chapter.end_page = parsed_chapter.end_page
+                db_chapters.append(chapter)
 
-            db_chunks = [
-                Chunk(
-                    user_id=doc.user_id,
-                    document_id=doc.id,
-                    chapter_id=db_chapters[0].id if db_chapters else None,
-                    ordinal=ck.ordinal,
-                    page_start=ck.page_start,
-                    page_end=ck.page_end,
-                    heading_path=ck.heading_path,
-                    body=ck.body,
-                    token_count=ck.token_count,
-                    qdrant_point_id=uuid.uuid4(),
-                )
-                for ck in parse_result.chunks
-            ]
-            await repo.create_chunks(db_chunks)
+            if new_chapters:
+                await repo.create_chapters(new_chapters)
+            else:
+                await session.flush()
+
+            existing_chunks_result = await session.execute(
+                select(Chunk).where(Chunk.document_id == doc.id).order_by(Chunk.ordinal)
+            )
+            existing_chunks = {
+                chunk.ordinal: chunk for chunk in existing_chunks_result.scalars()
+            }
+            db_chunks: list[Chunk] = []
+            new_chunks: list[Chunk] = []
+            for parsed_chunk in parse_result.chunks:
+                chunk = existing_chunks.pop(parsed_chunk.ordinal, None)
+                if chunk is None:
+                    chunk = Chunk(
+                        user_id=doc.user_id,
+                        document_id=doc.id,
+                        ordinal=parsed_chunk.ordinal,
+                        page_start=parsed_chunk.page_start,
+                        page_end=parsed_chunk.page_end,
+                        heading_path=parsed_chunk.heading_path,
+                        body=parsed_chunk.body,
+                        token_count=parsed_chunk.token_count,
+                    )
+                    new_chunks.append(chunk)
+                else:
+                    chunk.page_start = parsed_chunk.page_start
+                    chunk.page_end = parsed_chunk.page_end
+                    chunk.heading_path = parsed_chunk.heading_path
+                    chunk.body = parsed_chunk.body
+                    chunk.token_count = parsed_chunk.token_count
+
+                chunk.chapter_id = db_chapters[0].id if db_chapters else None
+                db_chunks.append(chunk)
+
+            if new_chunks:
+                await repo.create_chunks(new_chunks)
+            else:
+                await session.flush()
+            for chunk in db_chunks:
+                chunk.qdrant_point_id = chunk.id
+            stale_chunks = list(existing_chunks.values())
+            stale_chapters = list(existing_chapters.values())
             await session.commit()
             logger.info(
                 "document_ingestion_stage_completed",
@@ -195,7 +233,10 @@ async def _async_process_document(job_id_str: str) -> None:
             await session.commit()
             chunk_texts = [ck.body for ck in db_chunks]
             stage_started_at = time.perf_counter()
-            chunk_embeddings = await asyncio.to_thread(embedding_service.embed_batch, chunk_texts)
+            chunk_embeddings = await asyncio.to_thread(
+                embedding_service.embed_documents,
+                chunk_texts,
+            )
             logger.info(
                 "document_ingestion_stage_completed",
                 doc_id=str(doc.id),
@@ -205,6 +246,7 @@ async def _async_process_document(job_id_str: str) -> None:
             )
 
             # Upsert into Qdrant
+            chapter_titles = {chapter.id: chapter.title for chapter in db_chapters}
             qdrant_points = [
                 {
                     "id": str(ck.id),
@@ -214,15 +256,34 @@ async def _async_process_document(job_id_str: str) -> None:
                         "document_id": str(doc.id),
                         "chunk_id": str(ck.id),
                         "chapter_id": str(ck.chapter_id) if ck.chapter_id else None,
+                        "chapter_title": chapter_titles.get(ck.chapter_id),
+                        "section": ck.heading_path,
                         "page_start": ck.page_start,
                         "page_end": ck.page_end,
+                        "text": ck.body,
                         "token_count": ck.token_count,
+                        "embedding_model": embedding_service.model_name,
+                        "embedding_version": embedding_service.version,
+                        "embedding_dimension": embedding_service.dimension,
                     },
                 }
                 for ck, emb in zip(db_chunks, chunk_embeddings)
             ]
+            if len(qdrant_points) != len(db_chunks):
+                raise RuntimeError("Embedding count did not match persisted document chunks")
             stage_started_at = time.perf_counter()
             await qdrant_adapter.upsert_points(qdrant_points)
+
+            if stale_chunks:
+                await qdrant_adapter.delete_points([str(chunk.id) for chunk in stale_chunks])
+                for chunk in stale_chunks:
+                    await session.delete(chunk)
+            for chapter in stale_chapters:
+                await session.delete(chapter)
+            for chunk in db_chunks:
+                chunk.embedding_model = embedding_service.model_name
+                chunk.embedding_version = embedding_service.version
+                chunk.embedding_dimension = embedding_service.dimension
             await session.commit()
             logger.info(
                 "document_ingestion_stage_completed",
