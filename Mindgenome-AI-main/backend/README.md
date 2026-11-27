@@ -109,6 +109,25 @@ the Alembic head, and the chunk embedding columns before serving requests.
 Ingestion workers perform the same verification before processing their first
 job. Configure the API and each worker with the same `DATABASE_URL`.
 
+#### Temporary startup database diagnostic
+
+The backend temporarily emits a `temporary_database_diagnostic` structured log
+before enforcing the production PostgreSQL requirement. It reports only the
+database driver, whether `DATABASE_URL` was explicitly configured, and (for
+SQLite) the resolved file path, file existence, table names, row counts, and
+Alembic revision. It never logs the URL or row contents and opens SQLite files
+in read-only mode. Render disk persistence is reported as unknown because the
+backend configuration in this repository does not declare the managed service's
+disk mount.
+
+After deploying this temporary diagnostic, open the backend service's Render
+**Logs**, select the latest deploy/startup, and search for
+`temporary_database_diagnostic`. The production PostgreSQL validation remains
+enabled, so this diagnostic does not make an SQLite deployment start
+successfully. Once the production database has been identified, remove the
+temporary module `app/db/diagnostics.py`, its import and invocation in
+`app/db/session.py`, the diagnostic tests, and this section of the README.
+
 From the backend service root in Render Shell, first inspect the migration
 state:
 

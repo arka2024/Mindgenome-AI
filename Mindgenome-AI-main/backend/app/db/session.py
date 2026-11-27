@@ -15,9 +15,11 @@ from sqlalchemy.ext.asyncio import (
 )
 from app.core.config import settings
 from app.core.logging import logger
+from app.db.diagnostics import log_database_diagnostics
 
 
 def validate_database_configuration() -> str:
+    log_database_diagnostics()
     database_url = settings.async_database_url
     if settings.is_production and not database_url.startswith("postgresql+asyncpg://"):
         raise RuntimeError(
