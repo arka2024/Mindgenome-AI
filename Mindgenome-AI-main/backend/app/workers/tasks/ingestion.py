@@ -10,7 +10,7 @@ from app.adapters.qdrant import qdrant_adapter
 from app.adapters.storage import storage_adapter
 from app.core.config import settings
 from app.core.logging import logger
-from app.db.session import AsyncSessionLocal
+from app.db.session import AsyncSessionLocal, ensure_production_schema
 from app.models.document import Chapter, Chunk, Document
 from app.models.enums import DocumentStatus, IngestionStatus, LLMPurpose
 from app.models.learning import Concept
@@ -58,6 +58,7 @@ async def dispatch_document_ingestion(job_id_str: str) -> None:
 
 
 async def _async_process_document(job_id_str: str) -> None:
+    await ensure_production_schema()
     ingestion_started_at = time.perf_counter()
     job_id = uuid.UUID(job_id_str)
     async with AsyncSessionLocal() as session:

@@ -4,6 +4,7 @@ import json
 from typing import Any
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 
 class Settings(BaseSettings):
@@ -15,6 +16,8 @@ class Settings(BaseSettings):
     )
 
     APP_ENV: str = "local"
+    RENDER: bool = False
+    RENDER_SERVICE_ID: str = ""
     APP_DEBUG: bool = False
     APP_SECRET_KEY: str = "dev-secret-key-must-be-changed-in-production-minimum-64-characters-long"
     API_PUBLIC_URL: str = "http://localhost:8000"
@@ -117,7 +120,25 @@ class Settings(BaseSettings):
 
     @property
     def is_production(self) -> bool:
-        return self.APP_ENV.lower() in ("production", "prod")
+        return (
+            self.APP_ENV.lower() in ("production", "prod")
+            or self.RENDER
+            or bool(self.RENDER_SERVICE_ID)
+        )
+
+    @property
+    def runtime_environment(self) -> str:
+        return "production" if self.is_production else self.APP_ENV
+
+    @property
+    def async_database_url(self) -> str:
+        url = make_url(self.DATABASE_URL)
+        if url.drivername in ("postgres", "postgresql"):
+            query = dict(url.query)
+            if "sslmode" in query and "ssl" not in query:
+                query["ssl"] = query.pop("sslmode")
+            url = url.set(drivername="postgresql+asyncpg", query=query)
+        return url.render_as_string(hide_password=False)
 
 
 settings = Settings()

@@ -81,17 +81,72 @@ pytest --cov=app --cov-report=term-missing
 Configure the Render web service to use Python 3.12 and
 `Mindgenome-AI-main/backend` as its repository root directory. The
 `.python-version` file pins Python 3.12.10 so Render does not select a newer
-Python release without a compatible CPU PyTorch wheel. If deploying with
-Docker, the Dockerfile binds Uvicorn to Render's `PORT` and serves the
-liveness check at `/health`. Set Render's health check path to `/health`; use
-`/ready` separately to verify database and service dependencies.
+Python release unexpectedly. If deploying with Docker, the Dockerfile binds
+Uvicorn to Render's `PORT` and serves the liveness check at `/health`. Set
+Render's health check path to `/health`; use `/ready` separately to verify
+database and service dependencies.
 
-In the Render environment, set `DATABASE_URL` to the production PostgreSQL
-connection string using the `postgresql+asyncpg://` scheme. Set
+The Render Blueprint in `infra/render.yaml` configures only the static
+frontend. Configure the backend web service separately in the Render dashboard.
+Set `APP_ENV=production` and set `DATABASE_URL` to the intended persistent
+Render PostgreSQL database. The application also recognizes Render's
+`RENDER=true`/`RENDER_SERVICE_ID` environment values and refuses to start
+against SQLite there. Standard `postgresql://` Render URLs are normalized to
+the asyncpg driver automatically. Do not copy credentials into source files,
+logs, or support messages.
+
+Set
 `CORS_ORIGINS` to a JSON list containing the deployed frontend origin, for
 example `["https://mindgenomeai.vercel.app"]`, and set `FRONTEND_PUBLIC_URL`
 to `https://mindgenomeai.vercel.app`. Keep credentials in Render environment
 variables, not in this repository.
+
+### Production database migrations
+
+The application never applies schema changes at startup. Local SQLite may use
+`create_all()` for development only; on Render, startup verifies PostgreSQL,
+the Alembic head, and the chunk embedding columns before serving requests.
+Ingestion workers perform the same verification before processing their first
+job. Configure the API and each worker with the same `DATABASE_URL`.
+
+From the backend service root in Render Shell, first inspect the migration
+state:
+
+```bash
+alembic -c alembic.ini heads
+alembic -c alembic.ini current
+```
+
+If the database is already at `001_initial`, apply the non-destructive
+embedding-column migration with:
+
+```bash
+alembic -c alembic.ini upgrade head
+```
+
+The expected new revision is `002_embedding_provenance`; it only adds three
+nullable columns to `chunks` and does not drop or recreate data. Confirm with:
+
+```bash
+alembic -c alembic.ini current
+```
+
+If `alembic current` reports no revision while application tables already
+exist, **do not run `upgrade head` or `stamp` blindly**. The first migration is
+a baseline that creates the schema. Back up the database, compare its existing
+schema with revision `001_initial`, then only if they match exactly, mark that
+baseline and apply the additive migration:
+
+```bash
+alembic -c alembic.ini stamp 001_initial
+alembic -c alembic.ini upgrade head
+```
+
+`stamp` changes only Alembic's revision record; it does not alter the schema.
+Never use it to bypass a schema mismatch. If Render is currently running on
+SQLite and the intended persistent PostgreSQL database has not been configured,
+identify and back up the current data first. Pointing `DATABASE_URL` at
+PostgreSQL does not transfer SQLite users, documents, chunks, or jobs.
 
 Ingestion logs include elapsed time for parsing, embedding, vector storage,
 concept extraction, and graph building. Scanned PDFs OCR up to three pages

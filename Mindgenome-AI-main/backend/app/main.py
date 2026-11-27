@@ -13,7 +13,12 @@ from app.api.v1.health import router as root_health_router
 from app.core.config import settings
 from app.core.exceptions import ProblemException, problem_json_response
 from app.core.logging import logger, setup_logging
-from app.db.session import check_db_health, engine
+from app.db.session import (
+    DATABASE_URL,
+    check_db_health,
+    engine,
+    ensure_production_schema,
+)
 
 
 @asynccontextmanager
@@ -22,16 +27,18 @@ async def lifespan(app: FastAPI):
     setup_logging()
     logger.info(
         "server_starting",
-        env=settings.APP_ENV,
+        env=settings.runtime_environment,
         debug=settings.APP_DEBUG,
     )
-    if settings.DATABASE_URL.startswith("sqlite"):
+    if settings.is_production:
+        await ensure_production_schema()
+    elif DATABASE_URL.startswith("sqlite"):
         import app.models  # noqa: F401
         from app.db.base import Base
 
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
-        logger.info("sqlite_tables_initialized")
+        logger.info("local_sqlite_tables_initialized")
 
         # Recover local queued jobs after restarts or when a broker is unavailable.
         import asyncio
